@@ -17,13 +17,22 @@ st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch
 # =========================
 KTS_PER_MS = 1.9438444924574
 
-@st.cache_data(show_spinner=False)
-def open_ds(url: str):
-    # Prefer pydap on Streamlit Cloud for OPeNDAP/ERDDAP
+# --- Openers tuned for Cloud ---
+def open_thredds(url: str):
+    """
+    THREDDS (NOMADS, NCEI, PacIOOS). Try default engine first (netCDF4),
+    fall back to pydap if needed.
+    """
     try:
-        return xr.open_dataset(url, engine="pydap")
+        return xr.open_dataset(url)  # default engine (netCDF4/requests)
     except Exception:
-        return xr.open_dataset(url)
+        return xr.open_dataset(url, engine="pydap")
+
+def open_dods(url: str):
+    """
+    ERDDAP .dods best with pydap (pure python). Use that explicitly.
+    """
+    return xr.open_dataset(url, engine="pydap")
 
 @lru_cache(maxsize=1024)
 def gfswave_url_for(ts: datetime):
@@ -41,11 +50,6 @@ def psl_v10_url(year: int):
 @lru_cache(maxsize=1)
 def pacioos_ww3_url():
     return "https://pae-paha.pacioos.hawaii.edu/thredds/dodsC/ww3_global/WaveWatch_III_Global_Wave_Model_best.ncd"
-
-@lru_cache(maxsize=1)
-def coastwatch_currents_url():
-    # ERDDAP OPeNDAP endpoint (.dods) for pydap
-    return "https://coastwatch.noaa.gov/erddap/griddap/noaacwBLENDEDNRTcurrentsDaily.dods"
 
 def to_0_360(lon):
     return lon if lon >= 0 else lon + 360
@@ -77,16 +81,17 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return 2*R*np.arcsin(np.sqrt(a))
 
 def _finite_mask(arr):
-    # Handle masked arrays from pydap
+    import numpy as np
     if isinstance(arr, np.ma.MaskedArray):
-        mask = ~arr.mask
         data = arr.filled(np.nan)
+        mask = ~arr.mask
         return data, mask
     else:
         return arr, np.isfinite(arr)
 
-def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=2.0):
-    """Select nearest point; if NaN/masked, search a box (±max_deg), else expand to ±expand_deg."""
+def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=5.0):
+    """Select nearest point; if NaN/masked, search a box (±max_deg), else expand up to ±expand_deg."""
+    import numpy as np
     t, y, x = guess_axes(da)
     lon_vec = da.coords[x].values
     lon_req = lon
@@ -99,7 +104,7 @@ def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=2.0):
     try:
         sel = da.sel({t: ts, y: lat, x: lon_req}, method="nearest")
         val = sel.values
-        data, mask = _finite_mask(val)
+        data, _ = _finite_mask(val)
         valf = float(np.array(data).squeeze()) if np.size(data) == 1 else np.nan
         if np.isfinite(valf):
             return valf, float(sel.coords[y]), float(sel.coords[x])
@@ -114,11 +119,9 @@ def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=2.0):
         xx = box.coords[x].values
         Y, X = np.meshgrid(yy, xx, indexing="ij")
         dist = haversine_km(lat, lon_req, Y, X)
-
         arr = np.array(box.values)
         data, mask = _finite_mask(arr)
-        if np.ndim(data) >= 2:
-            # last two dims are y,x
+        if data.ndim >= 2:
             d2 = dist.copy()
             d2[~mask] = np.inf
             if not np.isfinite(d2).any():
@@ -126,17 +129,14 @@ def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=2.0):
             iy, ix = np.unravel_index(np.argmin(d2), d2.shape)
             val = float(data[iy, ix])
             return val, float(yy[iy]), float(xx[ix])
-        else:
-            return np.nan, lat, lon_req
+        return np.nan, lat, lon_req
 
-    # try small box then bigger
     val, y_used, x_used = search_box(max_deg)
     if not np.isfinite(val):
         val, y_used, x_used = search_box(expand_deg)
     return val, y_used, x_used
 
 def find_var(ds, *cands):
-    """Find first variable whose lowercase name contains any of cands (strings)."""
     cands = [c.lower() for c in cands]
     for k in ds.data_vars:
         kl = k.lower()
@@ -156,17 +156,17 @@ def get_wind(ts: datetime, lat: float, lon: float):
     if ts.date() >= recent_cut:
         try:
             url = gfswave_url_for(ts)
-            ds = open_ds(url)
+            ds = open_thredds(url)  # THREDDS
             wspd_ms, y_used, x_used = nearest_ocean_value(ds["windsfc"], tsn, lat, lon0360)
             wdir, _, _ = nearest_ocean_value(ds["wdirsfc"], tsn, y_used, x_used)
             return {"source_wind": url, "wind_speed_kts": float(wspd_ms) * KTS_PER_MS, "wind_dir_from_degT": float(wdir)}
         except Exception:
             pass
 
-    # PSL fallback (global, continuous)
+    # PSL fallback (global, continuous via THREDDS)
     try:
-        u = open_ds(psl_u10_url(ts.year))
-        v = open_ds(psl_v10_url(ts.year))
+        u = open_thredds(psl_u10_url(ts.year))
+        v = open_thredds(psl_v10_url(ts.year))
         uval, y_used, x_used = nearest_ocean_value(u["uwnd"], tsn, lat, lon0360)
         vval, _, _ = nearest_ocean_value(v["vwnd"], tsn, y_used, x_used)
         spd_ms, dir_from = wind_from_uv(float(uval), float(vval))
@@ -180,8 +180,9 @@ def get_waves(ts: datetime, lat: float, lon: float):
     recent_cut = today - timedelta(days=6)
     try:
         if ts.date() >= recent_cut:
+            # NOMADS WW3 0.25° (recent)
             url = gfswave_url_for(ts)
-            ds = open_ds(url)
+            ds = open_thredds(url)
             lon0360 = to_0_360(lon)
             hs_val, y_used, x_used = nearest_ocean_value(ds["htsgwsfc"], tsn, lat, lon0360)
             dir_sig_val, _, _      = nearest_ocean_value(ds["dirpwsfc"], tsn, y_used, x_used)
@@ -189,66 +190,72 @@ def get_waves(ts: datetime, lat: float, lon: float):
             wvdir_val, _, _        = nearest_ocean_value(ds["wvdirsfc"], tsn, y_used, x_used)
             swh_val, _, _          = nearest_ocean_value(ds["swell_1"], tsn, y_used, x_used)
             swdir_val, _, _        = nearest_ocean_value(ds["swdir_1"], tsn, y_used, x_used)
-            return {
-                "source_wave": url,
-                "sampled_lat": y_used, "sampled_lon": x_used,
-                "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
-                "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
-                "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
-            }
         else:
+            # PacIOOS WW3 Global “best” (continuous)
             url = pacioos_ww3_url()
-            ds = open_ds(url)
+            ds = open_thredds(url)
+            # robust variable names
             var_hsig  = find_var(ds, "thgt", "hs", "significant wave height")
             var_dirsg = find_var(ds, "tdir", "primary wave dir", "dirpw")
             var_wvh   = find_var(ds, "whgt", "wind wave height", "sea height", "wind_sea")
             var_wvdir = find_var(ds, "wdir", "wind wave direction", "sea direction")
             var_swh   = find_var(ds, "shgt", "swell height")
             var_swdir = find_var(ds, "sdir", "swell direction")
-
-            hs_val, y_used, x_used = nearest_ocean_value(ds[var_hsig], tsn, lat, lon)
+            hs_val, y_used, x_used = nearest_ocean_value(ds[var_hsig],  tsn, lat, lon)
             dir_sig_val, _, _      = nearest_ocean_value(ds[var_dirsg], tsn, y_used, x_used)
-            wvh_val, _, _          = nearest_ocean_value(ds[var_wvh], tsn, y_used, x_used)
+            wvh_val, _, _          = nearest_ocean_value(ds[var_wvh],   tsn, y_used, x_used)
             wvdir_val, _, _        = nearest_ocean_value(ds[var_wvdir], tsn, y_used, x_used)
-            swh_val, _, _          = nearest_ocean_value(ds[var_swh], tsn, y_used, x_used)
+            swh_val, _, _          = nearest_ocean_value(ds[var_swh],   tsn, y_used, x_used)
             swdir_val, _, _        = nearest_ocean_value(ds[var_swdir], tsn, y_used, x_used)
-
             if not np.isfinite(wvh_val) and np.isfinite(hs_val) and np.isfinite(swh_val):
-                wvh_val = max(0.0, (hs_val**2 - swh_val**2))**0.5
-
-            return {
-                "source_wave": url,
-                "sampled_lat": y_used, "sampled_lon": x_used,
-                "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
-                "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
-                "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
-            }
+                wvh_val = max(0.0, (hs_val**2 - swh_val**2))**0.5  # energy split estimate
+        return {
+            "source_wave": url,
+            "sampled_lat": y_used, "sampled_lon": x_used,
+            "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
+            "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
+            "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
+        }
     except Exception as e:
         return {"error_wave": f"{e}"}
 
 def get_currents(ts: datetime, lat: float, lon: float):
     tsn = to_naive_utc(ts)
-    try:
-        url = coastwatch_currents_url()
-        ds = open_ds(url)
-        # Auto-detect variable names across ERDDAP flavors
+    t0 = tsn.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    def _try_currents(url):
+        ds = open_dods(url)
+        def find_var(ds, *cands):
+            cands = [c.lower() for c in cands]
+            for k in ds.data_vars:
+                kl = k.lower()
+                if any(c in kl for c in cands):
+                    return k
+            raise KeyError("no var")
         try:
-            var_u = find_var(ds, "u_current", "u sea", "eastward", "eastward_sea_water_velocity", "u")
-            var_v = find_var(ds, "v_current", "v sea", "northward", "northward_sea_water_velocity", "v")
+            var_u = find_var(ds, "u_current", "eastward", "eastward_sea_water_velocity", "u")
+            var_v = find_var(ds, "v_current", "northward", "northward_sea_water_velocity", "v")
         except Exception:
             var_u, var_v = "u_current", "v_current"
-        # daily; sample nearest valid ocean cell (expand up to 2° if needed)
-        t0 = tsn.replace(hour=0, minute=0, second=0, microsecond=0)
-        u_val, y_used, x_used = nearest_ocean_value(ds[var_u], t0, lat, lon, max_deg=0.75, expand_deg=2.0)
-        v_val, _, _           = nearest_ocean_value(ds[var_v], t0, y_used, x_used, max_deg=0.75, expand_deg=2.0)
-        if not (np.isfinite(u_val) and np.isfinite(v_val)):
-            return {"source_current": url, "sampled_lat": y_used, "sampled_lon": x_used,
-                    "current_speed_kts": np.nan, "current_dir_to_degT": np.nan}
-        spd_ms = float(np.hypot(u_val, v_val))
-        return {"source_current": url, "sampled_lat": y_used, "sampled_lon": x_used,
-                "current_speed_kts": spd_ms * KTS_PER_MS, "current_dir_to_degT": current_dir_to(u_val, v_val)}
-    except Exception as e:
-        return {"error_current": f"{e}"}
+        u_val, y_used, x_used = nearest_ocean_value(ds[var_u], t0, lat, lon, max_deg=0.75, expand_deg=5.0)
+        v_val, _, _           = nearest_ocean_value(ds[var_v], t0, y_used, x_used, max_deg=0.75, expand_deg=5.0)
+        if np.isfinite(u_val) and np.isfinite(v_val):
+            spd_ms = float(np.hypot(u_val, v_val))
+            return {
+                "source_current": url,
+                "sampled_lat": y_used, "sampled_lon": x_used,
+                "current_speed_kts": spd_ms * KTS_PER_MS,
+                "current_dir_to_degT": current_dir_to(u_val, v_val),
+            }
+        return None
+
+    # 1) CoastWatch blended NRT
+    r = _try_currents("https://coastwatch.noaa.gov/erddap/griddap/noaacwBLENDEDNRTcurrentsDaily.dods")
+    if r: return r
+    # 2) OSCAR fallback (global surface currents)
+    r = _try_currents("https://coastwatch.pfeg.noaa.gov/erddap/griddap/oscar_vel.dods")
+    if r: return r
+    return {"error_current": "No valid current found within 5° neighborhood for the requested day."}
 
 # =========================
 # UI: choose Single Point or File Upload
