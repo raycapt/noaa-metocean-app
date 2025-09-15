@@ -27,7 +27,6 @@ def open_ds(url: str):
 
 @lru_cache(maxsize=1024)
 def gfswave_url_for(ts: datetime):
-    # NOMADS WW3 0.25° (recent ~6 days)
     cyc = f"{(ts.hour // 6) * 6:02d}"
     return f"https://nomads.ncep.noaa.gov:9090/dods/wave/gfswave/{ts:%Y%m%d}/gfswave.global.0p25_{cyc}z"
 
@@ -41,43 +40,89 @@ def psl_v10_url(year: int):
 
 @lru_cache(maxsize=1)
 def pacioos_ww3_url():
-    # NOAA-funded IOOS PacIOOS WW3 Global "best"
     return "https://pae-paha.pacioos.hawaii.edu/thredds/dodsC/ww3_global/WaveWatch_III_Global_Wave_Model_best.ncd"
 
 @lru_cache(maxsize=1)
 def coastwatch_currents_url():
-    # Use ERDDAP OPeNDAP endpoint (.dods) for pydap
     return "https://coastwatch.noaa.gov/erddap/griddap/noaacwBLENDEDNRTcurrentsDaily.dods"
 
 def to_0_360(lon):
     return lon if lon >= 0 else lon + 360
 
-def nearest(ds, tname, t, yname, lat, xname, lon):
-    return ds.sel({tname: t, yname: lat, xname: lon}, method="nearest")
-
 def to_naive_utc(ts: datetime):
-    # OPeNDAP time coords are timezone-naive but in UTC
     if ts.tzinfo is None:
         return ts
     return ts.astimezone(timezone.utc).replace(tzinfo=None)
 
 def wind_from_uv(u, v):
     speed_ms = np.hypot(u, v)
-    # Meteorological wind direction = where wind is COMING FROM (deg true)
     deg_from = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
     return float(speed_ms), float(deg_from)
 
 def current_dir_to(u, v):
-    # Direction current flows TO (deg true)
     return float((90.0 - np.degrees(np.arctan2(v, u))) % 360.0)
+
+def guess_axes(da):
+    dims = list(da.dims)
+    t = next((d for d in dims if d in ("time","valid_time")), dims[0])
+    y = next((d for d in dims if d in ("lat","latitude","y")), dims[1 if len(dims)>1 else 0])
+    x = next((d for d in dims if d in ("lon","longitude","x")), dims[2 if len(dims)>2 else -1])
+    return t, y, x
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    R = 6371.0
+    dlat = np.radians(lat2-lat1); dlon = np.radians(lon2-lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
+    return 2*R*np.arcsin(np.sqrt(a))
+
+def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75):
+    """Select nearest point; if NaN, search a ±max_deg box for nearest finite ocean cell."""
+    t, y, x = guess_axes(da)
+    lon_vec = da.coords[x].values
+    lon_req = lon
+    if lon_vec.min() >= 0 and lon < 0:
+        lon_req = lon + 360
+    if lon_vec.max() > 180 and lon_req < 0:
+        lon_req = lon_req + 360
+
+    # 1) direct
+    try:
+        sel = da.sel({t: ts, y: lat, x: lon_req}, method="nearest")
+        val = sel.values
+        if np.size(val) == 1 and np.isfinite(float(val)):
+            return float(val), float(sel.coords[y]), float(sel.coords[x])
+    except Exception:
+        pass
+
+    # 2) box search
+    box = da.sel({t: ts, y: slice(lat-max_deg, lat+max_deg), x: slice(lon_req-max_deg, lon_req+max_deg)})
+    if box.size == 0:
+        return np.nan, float(lat), float(lon_req)
+    yy = box.coords[y].values
+    xx = box.coords[x].values
+    Y, X = np.meshgrid(yy, xx, indexing="ij")
+    dist = haversine_km(lat, lon_req, Y, X)
+    arr = np.array(box.values)
+    mask = np.isfinite(arr)
+    if mask.any():
+        iy, ix = np.unravel_index(np.nanargmin(np.where(mask, dist, np.nan)), arr.shape[-2:])
+        val = float(arr[..., iy, ix]) if arr.ndim >= 2 else float(arr[iy, ix])
+        return val, float(yy[iy]), float(xx[ix])
+    return np.nan, float(lat), float(lon_req)
+
+def find_var(ds, *cands):
+    """Find first data_var whose lowercase name contains any of cands (strings)."""
+    cands = [c.lower() for c in cands]
+    for k in ds.data_vars:
+        kl = k.lower()
+        if any(c in kl for c in cands):
+            return k
+    raise KeyError("No variable matched: " + ",".join(cands))
 
 # =========================
 # Data fetchers
 # =========================
 def get_wind(ts: datetime, lat: float, lon: float):
-    """Wind strategy:
-       - If within last ~6 days: NOMADS WW3 'windsfc'/'wdirsfc' (fast, 0.25°)
-       - Else: NOAA PSL NCEP/NCAR Reanalysis 10 m winds (global, continuous)"""
     tsn = to_naive_utc(ts)
     today = datetime.now(timezone.utc).date()
     recent_cut = today - timedelta(days=6)
@@ -87,27 +132,24 @@ def get_wind(ts: datetime, lat: float, lon: float):
         try:
             url = gfswave_url_for(ts)
             ds = open_ds(url)
-            wspd_ms = nearest(ds["windsfc"], "time", tsn, "lat", lat, "lon", lon0360).values
-            wdir = nearest(ds["wdirsfc"], "time", tsn, "lat", lat, "lon", lon0360).values
+            wspd_ms, y_used, x_used = nearest_ocean_value(ds["windsfc"], tsn, lat, lon0360)
+            wdir, _, _ = nearest_ocean_value(ds["wdirsfc"], tsn, y_used, x_used)
             return {"source_wind": url, "wind_speed_kts": float(wspd_ms) * KTS_PER_MS, "wind_dir_from_degT": float(wdir)}
-        except Exception as e:
-            # fall through to PSL reanalysis
+        except Exception:
             pass
 
+    # PSL fallback (global, continuous)
     try:
         u = open_ds(psl_u10_url(ts.year))
         v = open_ds(psl_v10_url(ts.year))
-        uval = nearest(u["uwnd"], "time", tsn, "lat", lat, "lon", lon0360).values
-        vval = nearest(v["vwnd"], "time", tsn, "lat", lat, "lon", lon0360).values
+        uval, y_used, x_used = nearest_ocean_value(u["uwnd"], tsn, lat, lon0360)
+        vval, _, _ = nearest_ocean_value(v["vwnd"], tsn, y_used, x_used)
         spd_ms, dir_from = wind_from_uv(float(uval), float(vval))
         return {"source_wind": psl_u10_url(ts.year), "wind_speed_kts": spd_ms * KTS_PER_MS, "wind_dir_from_degT": dir_from}
     except Exception as e2:
         return {"error_wind": f"{e2}"}
 
 def get_waves(ts: datetime, lat: float, lon: float):
-    """Waves:
-       - recent: NOMADS WW3 0.25°
-       - else: PacIOOS WW3 Global 'best' """
     tsn = to_naive_utc(ts)
     today = datetime.now(timezone.utc).date()
     recent_cut = today - timedelta(days=6)
@@ -116,58 +158,69 @@ def get_waves(ts: datetime, lat: float, lon: float):
             url = gfswave_url_for(ts)
             ds = open_ds(url)
             lon0360 = to_0_360(lon)
-            hs = nearest(ds["htsgwsfc"], "time", tsn, "lat", lat, "lon", lon0360)   # significant Hs (m)
-            dir_sig = nearest(ds["dirpwsfc"], "time", tsn, "lat", lat, "lon", lon0360)  # primary wave dir (deg true, FROM)
-            wvh = nearest(ds["wvhgtsfc"], "time", tsn, "lat", lat, "lon", lon0360)  # wind-wave height (m)
-            wvdir = nearest(ds["wvdirsfc"], "time", tsn, "lat", lat, "lon", lon0360)    # wind-wave dir (deg true, FROM)
-            swh = nearest(ds["swell_1"], "time", tsn, "lat", lat, "lon", lon0360)       # primary swell height (m)
-            swdir = nearest(ds["swdir_1"], "time", tsn, "lat", lat, "lon", lon0360)     # primary swell dir (deg true, FROM)
+            hs_val, y_used, x_used = nearest_ocean_value(ds["htsgwsfc"], tsn, lat, lon0360)
+            dir_sig_val, _, _      = nearest_ocean_value(ds["dirpwsfc"], tsn, y_used, x_used)
+            wvh_val, _, _          = nearest_ocean_value(ds["wvhgtsfc"], tsn, y_used, x_used)
+            wvdir_val, _, _        = nearest_ocean_value(ds["wvdirsfc"], tsn, y_used, x_used)
+            swh_val, _, _          = nearest_ocean_value(ds["swell_1"], tsn, y_used, x_used)
+            swdir_val, _, _        = nearest_ocean_value(ds["swdir_1"], tsn, y_used, x_used)
             return {
                 "source_wave": url,
-                "wave_hgt_m": float(wvh.values),
-                "wave_dir_degT": float(wvdir.values),
-                "swell_hgt_m": float(swh.values),
-                "swell_dir_degT": float(swdir.values),
-                "sig_wave_hs_m": float(hs.values),
-                "sig_wave_dir_degT": float(dir_sig.values),
+                "sampled_lat": y_used, "sampled_lon": x_used,
+                "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
+                "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
+                "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
             }
         else:
             url = pacioos_ww3_url()
             ds = open_ds(url)
-            lonx = to_0_360(lon) if float(ds["lon"].max()) > 180 else lon
-            hsig = nearest(ds["Thgt"], "time", tsn, "lat", lat, "lon", lonx)
-            dir_sig = nearest(ds["Tdir"], "time", tsn, "lat", lat, "lon", lonx)
-            wvh = nearest(ds["whgt"], "time", tsn, "lat", lat, "lon", lonx)
-            wvdir = nearest(ds["wdir"], "time", tsn, "lat", lat, "lon", lonx)
-            swh = nearest(ds["shgt"], "time", tsn, "lat", lat, "lon", lonx)
-            swdir = nearest(ds["sdir"], "time", tsn, "lat", lat, "lon", lonx)
+            # find variables robustly (dataset naming sometimes varies)
+            var_hsig = find_var(ds, "thgt", "hs", "significant wave height")
+            var_dirsig = find_var(ds, "tdir", "primary wave dir", "dirpw")
+            var_wvh = find_var(ds, "whgt", "wind wave height", "sea height", "wind_sea")
+            var_wvdir = find_var(ds, "wdir", "wind wave direction", "sea direction")
+            var_swh = find_var(ds, "shgt", "swell height")
+            var_swdir = find_var(ds, "sdir", "swell direction")
+
+            hs_val, y_used, x_used = nearest_ocean_value(ds[var_hsig], tsn, lat, lon)
+            dir_sig_val, _, _      = nearest_ocean_value(ds[var_dirsig], tsn, y_used, x_used)
+            wvh_val, _, _          = nearest_ocean_value(ds[var_wvh], tsn, y_used, x_used)
+            wvdir_val, _, _        = nearest_ocean_value(ds[var_wvdir], tsn, y_used, x_used)
+            swh_val, _, _          = nearest_ocean_value(ds[var_swh], tsn, y_used, x_used)
+            swdir_val, _, _        = nearest_ocean_value(ds[var_swdir], tsn, y_used, x_used)
+
+            # If wind-wave height missing, estimate from energy difference: Hs^2 ≈ Hsea^2 + Hswell^2
+            if not np.isfinite(wvh_val) and np.isfinite(hs_val) and np.isfinite(swh_val):
+                est = max(0.0, (hs_val**2 - swh_val**2))**0.5
+                wvh_val = est
+
             return {
                 "source_wave": url,
-                "wave_hgt_m": float(wvh.values),
-                "wave_dir_degT": float(wvdir.values),
-                "swell_hgt_m": float(swh.values),
-                "swell_dir_degT": float(swdir.values),
-                "sig_wave_hs_m": float(hsig.values),
-                "sig_wave_dir_degT": float(dir_sig.values),
+                "sampled_lat": y_used, "sampled_lon": x_used,
+                "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
+                "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
+                "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
             }
     except Exception as e:
         return {"error_wave": f"{e}"}
 
 def get_currents(ts: datetime, lat: float, lon: float):
-    """CoastWatch blended geostrophic currents (daily, 0.25°) via ERDDAP OPeNDAP"""
     tsn = to_naive_utc(ts)
     try:
         url = coastwatch_currents_url()
-        ds = open_ds(url)  # pydap engine
-        lonx = lon if float(ds["longitude"].min()) < 0 else to_0_360(lon)
+        ds = open_ds(url)
+        # daily; ERDDAP lon is -180..180
         t0 = tsn.replace(hour=0, minute=0, second=0, microsecond=0)
-        u = nearest(ds["u_current"], "time", t0, "latitude", lat, "longitude", lonx).values
-        v = nearest(ds["v_current"], "time", t0, "latitude", lat, "longitude", lonx).values
-        spd_ms = float(np.hypot(u, v))
+        u_val, y_used, x_used = nearest_ocean_value(ds["u_current"], t0, lat, lon)
+        v_val, _, _           = nearest_ocean_value(ds["v_current"], t0, y_used, x_used)
+        if not (np.isfinite(u_val) and np.isfinite(v_val)):
+            return {"source_current": url, "current_speed_kts": np.nan, "current_dir_to_degT": np.nan}
+        spd_ms = float(np.hypot(u_val, v_val))
         return {
             "source_current": url,
+            "sampled_lat": y_used, "sampled_lon": x_used,
             "current_speed_kts": spd_ms * KTS_PER_MS,
-            "current_dir_to_degT": current_dir_to(float(u), float(v)),
+            "current_dir_to_degT": current_dir_to(u_val, v_val),
         }
     except Exception as e:
         return {"error_current": f"{e}"}
@@ -213,13 +266,16 @@ def render_map(df_points, ts_col_name="timestamp"):
         swdir = r.get("swell_dir_degT", np.nan)
         curk = r.get("current_speed_kts", np.nan)
         curdir = r.get("current_dir_to_degT", np.nan)
+        sampled_lat = r.get("sampled_lat", r["lat"])
+        sampled_lon = r.get("sampled_lon", r["lon"])
         tooltip = (
             f"<b>{r[ts_col_name]}</b><br>"
             f"Wind: {ws:.1f} kt from {wd:.0f}°T<br>"
             f"SigWave: {hs:.1f} m from {hdir:.0f}°T<br>"
             f"Wind-wave: {wvh:.1f} m from {wvdir:.0f}°T<br>"
             f"Swell: {swh:.1f} m from {swdir:.0f}°T<br>"
-            f"Current: {curk:.2f} kt to {curdir:.0f}°T"
+            f"Current: {curk:.2f} kt to {curdir:.0f}°T<br>"
+            f"<i>Sampled @ {sampled_lat:.3f}, {sampled_lon:.3f}</i>"
         )
         folium.CircleMarker(
             location=[float(r["lat"]), float(r["lon"])],

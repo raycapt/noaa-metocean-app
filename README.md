@@ -1,12 +1,6 @@
-# Streamlit NOAA Met-Ocean (Cloud-optimized)
+# Streamlit NOAA Met-Ocean (Cloud v2)
 
-This is tuned for **Streamlit Community Cloud**:
-- Uses **pydap** engine for OPeNDAP/ERDDAP
-- Converts timestamps to **naive UTC** before dataset selection
-- Wind fallback uses **NOAA PSL NCEP/NCAR Reanalysis** when older than NOMADS retention
-
-## Run
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Adds:
+- Nearest-ocean sampling for waves & currents (avoids land-mask NaNs near coast)
+- Robust variable names for PacIOOS WW3 (wind-wave fields vary)
+- If wind-wave height missing, estimate from Hs and swell via quadratic energy difference
