@@ -1,6 +1,10 @@
-# Streamlit NOAA Met-Ocean (Cloud v2)
+# Streamlit NOAA Met-Ocean (Cloud v3)
 
-Adds:
-- Nearest-ocean sampling for waves & currents (avoids land-mask NaNs near coast)
-- Robust variable names for PacIOOS WW3 (wind-wave fields vary)
-- If wind-wave height missing, estimate from Hs and swell via quadratic energy difference
+This version hardens **currents**:
+- Auto-detects ERDDAP variable names (u/v current) across datasets
+- Handles masked arrays from pydap correctly
+- Nearest valid ocean cell search expands from ±0.75° up to ±2° if needed
+
+Also keeps:
+- Nearest-ocean sampling for waves
+- Robust PacIOOS WW3 variable discovery
