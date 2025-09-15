@@ -15,16 +15,13 @@ st.title("Historical NOAA Wind · Wave · Current at Positions")
 st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch wind (10 m), waves (WW3), and surface currents. "
            "Directions: Wind FROM (°T), currents TO (°T). Wave/swell directions are FROM (°T).")
 
-# =========================
-# Constants / helpers
-# =========================
 KTS_PER_MS = 1.9438444924574
 
 def _requests_session():
     s = requests.Session()
     s.headers.update({
         "User-Agent": "metocean-streamlit/1.0 (+https://github.com/)",
-        "Accept": "*/*",
+        "Accept": "application/json,text/*,*/*",
     })
     retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429,500,502,503,504], raise_on_status=False)
     adapter = HTTPAdapter(max_retries=retry)
@@ -32,21 +29,11 @@ def _requests_session():
     s.mount("https://", adapter)
     return s
 
-# --- Openers tuned for Cloud ---
 def open_thredds(url: str):
     try:
-        return xr.open_dataset(url)  # default (netCDF4)
-    except Exception:
-        # try pydap with session
-        return xr.open_dataset(url, engine="pydap", session=_requests_session())
-
-def open_dods(url: str):
-    # ERDDAP .dods best with pydap + custom session/UA
-    try:
-        return xr.open_dataset(url, engine="pydap", session=_requests_session())
-    except Exception:
-        # last resort: try default engine
         return xr.open_dataset(url)
+    except Exception:
+        return xr.open_dataset(url, engine="pydap", session=_requests_session())
 
 @lru_cache(maxsize=1024)
 def gfswave_url_for(ts: datetime):
@@ -90,7 +77,7 @@ def guess_axes(da):
 
 def haversine_km(lat1, lon1, lat2, lon2):
     R = 6371.0
-    dlat = np.radians(lat2-lat1); dlon = np.radians(lon2-lon1)
+    dlat = np.radians(lat2-lat1); dlon = np.radians(lat2-lon1)
     a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
     return 2*R*np.arcsin(np.sqrt(a))
 
@@ -113,7 +100,6 @@ def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=5.0):
     if np.max(lon_vec) > 180 and lon_req < 0:
         lon_req = lon_req + 360
 
-    # 1) direct
     try:
         sel = da.sel({t: ts, y: lat, x: lon_req}, method="nearest")
         val = sel.values
@@ -157,15 +143,11 @@ def find_var(ds, *cands):
             return k
     raise KeyError("No variable matched: " + ",".join(cands))
 
-# =========================
-# Data fetchers
-# =========================
 def get_wind(ts: datetime, lat: float, lon: float):
     tsn = to_naive_utc(ts)
     today = datetime.now(timezone.utc).date()
     recent_cut = today - timedelta(days=6)
     lon0360 = to_0_360(lon)
-
     if ts.date() >= recent_cut:
         try:
             url = gfswave_url_for(ts)
@@ -175,7 +157,6 @@ def get_wind(ts: datetime, lat: float, lon: float):
             return {"source_wind": url, "wind_speed_kts": float(wspd_ms) * KTS_PER_MS, "wind_dir_from_degT": float(wdir)}
         except Exception:
             pass
-
     try:
         u = open_thredds(psl_u10_url(ts.year))
         v = open_thredds(psl_v10_url(ts.year))
@@ -228,45 +209,66 @@ def get_waves(ts: datetime, lat: float, lon: float):
     except Exception as e:
         return {"error_wave": f"{e}"}
 
+def _erddap_json_point(base, dataset, time_iso, lat, lon, var_u, var_v):
+    url = (
+        f"{base}/griddap/{dataset}.json?"
+        f"{var_u}[({time_iso})][({lat})][({lon})],"
+        f"{var_v}[({time_iso})][({lat})][({lon})]"
+    )
+    s = _requests_session()
+    r = s.get(url, timeout=20)
+    r.raise_for_status()
+    js = r.json()
+    rows = js.get("table", {}).get("rows", [])
+    if not rows:
+        return None
+    u, v = rows[0]
+    if u is None or v is None:
+        return None
+    return float(u), float(v), url
+
 def get_currents(ts: datetime, lat: float, lon: float):
     tsn = to_naive_utc(ts)
-    t0 = tsn.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    def _try_currents(url):
-        ds = open_dods(url)
-        def find_var(ds, *cands):
-            cands = [c.lower() for c in cands]
-            for k in ds.data_vars:
-                kl = k.lower()
-                if any(c in kl for c in cands):
-                    return k
-            raise KeyError("no var")
-        try:
-            var_u = find_var(ds, "u_current", "eastward", "eastward_sea_water_velocity", "u")
-            var_v = find_var(ds, "v_current", "northward", "northward_sea_water_velocity", "v")
-        except Exception:
-            var_u, var_v = "u_current", "v_current"
-        u_val, y_used, x_used = nearest_ocean_value(ds[var_u], t0, lat, lon, max_deg=0.75, expand_deg=5.0)
-        v_val, _, _           = nearest_ocean_value(ds[var_v], t0, y_used, x_used, max_deg=0.75, expand_deg=5.0)
-        if np.isfinite(u_val) and np.isfinite(v_val):
-            spd_ms = float(np.hypot(u_val, v_val))
+    time_iso = tsn.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
+    lon_m = lon if -180 <= lon <= 180 else ((lon + 180) % 360) - 180
+    try:
+        out = _erddap_json_point(
+            "https://coastwatch.noaa.gov/erddap",
+            "noaacwBLENDEDNRTcurrentsDaily",
+            time_iso, lat, lon_m,
+            "u_current", "v_current"
+        )
+        if out:
+            u, v, url = out
+            spd_ms = float(np.hypot(u, v))
             return {
                 "source_current": url,
-                "sampled_lat": y_used, "sampled_lon": x_used,
+                "sampled_lat": lat, "sampled_lon": lon_m,
                 "current_speed_kts": spd_ms * KTS_PER_MS,
-                "current_dir_to_degT": current_dir_to(u_val, v_val),
+                "current_dir_to_degT": current_dir_to(u, v),
             }
-        return None
+    except Exception:
+        pass
+    try:
+        out = _erddap_json_point(
+            "https://coastwatch.pfeg.noaa.gov/erddap",
+            "oscar_vel",
+            time_iso, lat, lon_m,
+            "u", "v"
+        )
+        if out:
+            u, v, url = out
+            spd_ms = float(np.hypot(u, v))
+            return {
+                "source_current": url,
+                "sampled_lat": lat, "sampled_lon": lon_m,
+                "current_speed_kts": spd_ms * KTS_PER_MS,
+                "current_dir_to_degT": current_dir_to(u, v),
+            }
+    except Exception:
+        pass
+    return {"error_current": "No current from ERDDAP JSON (both sources). Try a different day or offshore point."}
 
-    r = _try_currents("https://coastwatch.noaa.gov/erddap/griddap/noaacwBLENDEDNRTcurrentsDaily.dods")
-    if r: return r
-    r = _try_currents("https://coastwatch.pfeg.noaa.gov/erddap/griddap/oscar_vel.dods")
-    if r: return r
-    return {"error_current": "No valid current found within 5° neighborhood for the requested day."}
-
-# =========================
-# UI (Single point / Upload file)
-# =========================
 mode = st.radio("Choose input mode", ["Single point", "Upload file"], horizontal=True)
 
 def color_for_wind(ws):

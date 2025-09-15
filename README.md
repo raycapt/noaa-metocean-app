@@ -1,10 +1,8 @@
-# Met-Ocean Streamlit — v5
+# Met-Ocean Streamlit — v7 (refresh)
 
-**Fixes the ERDDAP HTTPError** by using pydap with a custom User-Agent + retries.
-Also pins versions for stability. Recommended Python version on Streamlit Cloud: **3.11**.
+Currents via ERDDAP JSON (no OPeNDAP engines). Wind/Waves via THREDDS/xarray.
 
-## Run locally
-```bash
-pip install -r requirements.txt
-streamlit run app.py
-```
+Deploy on Streamlit Cloud:
+1) Push files to GitHub
+2) Set Python **3.11**
+3) App file: `app.py`
