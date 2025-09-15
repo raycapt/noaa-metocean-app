@@ -6,5 +6,7 @@ netCDF4
 folium
 streamlit-folium
 openpyxl
-pydap
+pydap==3.4.1
 cftime
+requests
+urllib3<3

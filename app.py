@@ -2,6 +2,9 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import xarray as xr
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
 from functools import lru_cache
 import folium
@@ -9,7 +12,7 @@ from streamlit_folium import st_folium
 
 st.set_page_config(page_title="Met-Ocean at Points · 2024→today", layout="wide")
 st.title("Historical NOAA Wind · Wave · Current at Positions")
-st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch wind (10 m), waves (WW3), and surface currents.\n"
+st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch wind (10 m), waves (WW3), and surface currents. "
            "Directions: Wind FROM (°T), currents TO (°T). Wave/swell directions are FROM (°T).")
 
 # =========================
@@ -17,22 +20,33 @@ st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch
 # =========================
 KTS_PER_MS = 1.9438444924574
 
+def _requests_session():
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": "metocean-streamlit/1.0 (+https://github.com/)",
+        "Accept": "*/*",
+    })
+    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429,500,502,503,504], raise_on_status=False)
+    adapter = HTTPAdapter(max_retries=retry)
+    s.mount("http://", adapter)
+    s.mount("https://", adapter)
+    return s
+
 # --- Openers tuned for Cloud ---
 def open_thredds(url: str):
-    """
-    THREDDS (NOMADS, NCEI, PacIOOS). Try default engine first (netCDF4),
-    fall back to pydap if needed.
-    """
     try:
-        return xr.open_dataset(url)  # default engine (netCDF4/requests)
+        return xr.open_dataset(url)  # default (netCDF4)
     except Exception:
-        return xr.open_dataset(url, engine="pydap")
+        # try pydap with session
+        return xr.open_dataset(url, engine="pydap", session=_requests_session())
 
 def open_dods(url: str):
-    """
-    ERDDAP .dods best with pydap (pure python). Use that explicitly.
-    """
-    return xr.open_dataset(url, engine="pydap")
+    # ERDDAP .dods best with pydap + custom session/UA
+    try:
+        return xr.open_dataset(url, engine="pydap", session=_requests_session())
+    except Exception:
+        # last resort: try default engine
+        return xr.open_dataset(url)
 
 @lru_cache(maxsize=1024)
 def gfswave_url_for(ts: datetime):
@@ -90,7 +104,6 @@ def _finite_mask(arr):
         return arr, np.isfinite(arr)
 
 def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=5.0):
-    """Select nearest point; if NaN/masked, search a box (±max_deg), else expand up to ±expand_deg."""
     import numpy as np
     t, y, x = guess_axes(da)
     lon_vec = da.coords[x].values
@@ -156,14 +169,13 @@ def get_wind(ts: datetime, lat: float, lon: float):
     if ts.date() >= recent_cut:
         try:
             url = gfswave_url_for(ts)
-            ds = open_thredds(url)  # THREDDS
+            ds = open_thredds(url)
             wspd_ms, y_used, x_used = nearest_ocean_value(ds["windsfc"], tsn, lat, lon0360)
             wdir, _, _ = nearest_ocean_value(ds["wdirsfc"], tsn, y_used, x_used)
             return {"source_wind": url, "wind_speed_kts": float(wspd_ms) * KTS_PER_MS, "wind_dir_from_degT": float(wdir)}
         except Exception:
             pass
 
-    # PSL fallback (global, continuous via THREDDS)
     try:
         u = open_thredds(psl_u10_url(ts.year))
         v = open_thredds(psl_v10_url(ts.year))
@@ -180,7 +192,6 @@ def get_waves(ts: datetime, lat: float, lon: float):
     recent_cut = today - timedelta(days=6)
     try:
         if ts.date() >= recent_cut:
-            # NOMADS WW3 0.25° (recent)
             url = gfswave_url_for(ts)
             ds = open_thredds(url)
             lon0360 = to_0_360(lon)
@@ -191,10 +202,8 @@ def get_waves(ts: datetime, lat: float, lon: float):
             swh_val, _, _          = nearest_ocean_value(ds["swell_1"], tsn, y_used, x_used)
             swdir_val, _, _        = nearest_ocean_value(ds["swdir_1"], tsn, y_used, x_used)
         else:
-            # PacIOOS WW3 Global “best” (continuous)
             url = pacioos_ww3_url()
             ds = open_thredds(url)
-            # robust variable names
             var_hsig  = find_var(ds, "thgt", "hs", "significant wave height")
             var_dirsg = find_var(ds, "tdir", "primary wave dir", "dirpw")
             var_wvh   = find_var(ds, "whgt", "wind wave height", "sea height", "wind_sea")
@@ -208,7 +217,7 @@ def get_waves(ts: datetime, lat: float, lon: float):
             swh_val, _, _          = nearest_ocean_value(ds[var_swh],   tsn, y_used, x_used)
             swdir_val, _, _        = nearest_ocean_value(ds[var_swdir], tsn, y_used, x_used)
             if not np.isfinite(wvh_val) and np.isfinite(hs_val) and np.isfinite(swh_val):
-                wvh_val = max(0.0, (hs_val**2 - swh_val**2))**0.5  # energy split estimate
+                wvh_val = max(0.0, (hs_val**2 - swh_val**2))**0.5
         return {
             "source_wave": url,
             "sampled_lat": y_used, "sampled_lon": x_used,
@@ -249,27 +258,25 @@ def get_currents(ts: datetime, lat: float, lon: float):
             }
         return None
 
-    # 1) CoastWatch blended NRT
     r = _try_currents("https://coastwatch.noaa.gov/erddap/griddap/noaacwBLENDEDNRTcurrentsDaily.dods")
     if r: return r
-    # 2) OSCAR fallback (global surface currents)
     r = _try_currents("https://coastwatch.pfeg.noaa.gov/erddap/griddap/oscar_vel.dods")
     if r: return r
     return {"error_current": "No valid current found within 5° neighborhood for the requested day."}
 
 # =========================
-# UI: choose Single Point or File Upload
+# UI (Single point / Upload file)
 # =========================
 mode = st.radio("Choose input mode", ["Single point", "Upload file"], horizontal=True)
 
 def color_for_wind(ws):
     try:
         if ws < 16.0:
-            return "#1ea21e"  # green
+            return "#1ea21e"
         elif ws > 25.0:
-            return "#cc1f1f"  # red
+            return "#cc1f1f"
         else:
-            return "#f0a202"  # orange
+            return "#f0a202"
     except Exception:
         return "#666666"
 
@@ -317,7 +324,6 @@ def render_map(df_points, ts_col_name="timestamp"):
     folium.LayerControl().add_to(m)
     st_folium(m, use_container_width=True, returned_objects=[])
 
-# ---- Single point mode
 if mode == "Single point":
     with st.form("single"):
         c1, c2, c3 = st.columns([2,1,1])
@@ -341,8 +347,6 @@ if mode == "Single point":
         st.subheader("Result")
         st.dataframe(df_single, use_container_width=True)
         render_map(df_single)
-
-# ---- Upload mode
 else:
     st.markdown("**Upload CSV or Excel** with columns: `timestamp`, `lat`, `lon` (case-insensitive). Time must be UTC.")
     example = pd.DataFrame({
@@ -370,7 +374,6 @@ else:
             st.error("Could not find timestamp/lat/lon columns. Use headers: timestamp, lat, lon.")
             st.stop()
 
-        # parse & validate
         df["_ts"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
         for c in [lat_col, lon_col]:
             df[c] = pd.to_numeric(df[c], errors="coerce")
@@ -378,7 +381,6 @@ else:
             st.error("Some timestamps or coordinates are invalid.")
             st.stop()
 
-        # process rows
         records = []
         prog = st.progress(0)
         total = len(df)
