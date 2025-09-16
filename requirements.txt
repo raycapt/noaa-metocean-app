@@ -1,11 +1,7 @@
 streamlit
 pandas
 numpy
-xarray
-netCDF4
+requests
+openpyxl
 folium
 streamlit-folium
-openpyxl
-cftime
-requests
-urllib3<3

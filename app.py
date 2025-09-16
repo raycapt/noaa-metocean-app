@@ -1,407 +1,267 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import xarray as xr
-import requests
+import requests, math
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from datetime import datetime, timezone, timedelta
-from functools import lru_cache
-import folium
-from streamlit_folium import st_folium
+from datetime import datetime, timezone
 
-st.set_page_config(page_title="Met-Ocean at Points · 2024→today", layout="wide")
-st.title("Historical NOAA Wind · Wave · Current at Positions")
-st.caption("Upload a CSV/XLSX OR enter a single timestamp/position. I’ll fetch wind (10 m), waves (WW3), and surface currents. "
-           "Directions: Wind FROM (°T), currents TO (°T). Wave/swell directions are FROM (°T).")
+st.set_page_config(page_title="Global Met-Ocean @ Points (2024→Now)", layout="wide")
+st.title("Global Wind · Waves · Swell · Currents @ Positions (NOAA/WW3)")
+st.caption("Enter a timestamp + position or upload CSV/XLSX (timestamp, lat, lon). "
+           "Waves at the requested time (hourly WW3). Winds & currents are daily, evaluated at 00:00Z of that date. "
+           "Wind/Swell/Wave **directions are FROM** (°T). **Current direction is GOING TO** (°T). "
+           "Wind speed shown in knots; wave heights in meters.")
 
 KTS_PER_MS = 1.9438444924574
 
-def _requests_session():
+def _session():
     s = requests.Session()
     s.headers.update({
-        "User-Agent": "metocean-streamlit/1.0 (+https://github.com/)",
+        "User-Agent": "metocean-streamlit-json/1.0 (+https://github.com/)",
         "Accept": "application/json,text/*,*/*",
     })
-    retry = Retry(total=3, backoff_factor=0.5, status_forcelist=[429,500,502,503,504], raise_on_status=False)
-    adapter = HTTPAdapter(max_retries=retry)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
+    retry = Retry(
+        total=4, connect=4, read=4,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    s.mount("http://", HTTPAdapter(max_retries=retry))
+    s.mount("https://", HTTPAdapter(max_retries=retry))
     return s
 
-def open_thredds(url: str):
-    try:
-        return xr.open_dataset(url)
-    except Exception:
-        return xr.open_dataset(url, engine="pydap", session=_requests_session())
+S = _session()
 
-@lru_cache(maxsize=1024)
-def gfswave_url_for(ts: datetime):
-    cyc = f"{(ts.hour // 6) * 6:02d}"
-    return f"https://nomads.ncep.noaa.gov:9090/dods/wave/gfswave/{ts:%Y%m%d}/gfswave.global.0p25_{cyc}z"
-
-@lru_cache(maxsize=1024)
-def psl_u10_url(year: int):
-    return f"https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis/surface_gauss/uwnd.10m.gauss.{year}.nc"
-
-@lru_cache(maxsize=1024)
-def psl_v10_url(year: int):
-    return f"https://psl.noaa.gov/thredds/dodsC/Datasets/ncep.reanalysis/surface_gauss/vwnd.10m.gauss.{year}.nc"
-
-@lru_cache(maxsize=1)
-def pacioos_ww3_url():
-    return "https://pae-paha.pacioos.hawaii.edu/thredds/dodsC/ww3_global/WaveWatch_III_Global_Wave_Model_best.ncd"
-
-def to_0_360(lon):
-    return lon if lon >= 0 else lon + 360
-
-def to_naive_utc(ts: datetime):
-    if ts.tzinfo is None:
-        return ts
-    return ts.astimezone(timezone.utc).replace(tzinfo=None)
-
-def wind_from_uv(u, v):
-    speed_ms = np.hypot(u, v)
-    deg_from = (270.0 - np.degrees(np.arctan2(v, u))) % 360.0
-    return float(speed_ms), float(deg_from)
-
-def current_dir_to(u, v):
-    return float((90.0 - np.degrees(np.arctan2(v, u))) % 360.0)
-
-def guess_axes(da):
-    dims = list(da.dims)
-    t = next((d for d in dims if d in ("time","valid_time")), dims[0])
-    y = next((d for d in dims if d in ("lat","latitude","y")), dims[1 if len(dims)>1 else 0])
-    x = next((d for d in dims if d in ("lon","longitude","x")), dims[2 if len(dims)>2 else -1])
-    return t, y, x
-
-def haversine_km(lat1, lon1, lat2, lon2):
-    R = 6371.0
-    dlat = np.radians(lat2-lat1); dlon = np.radians(lat2-lon1)
-    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1))*np.cos(np.radians(lat2))*np.sin(dlon/2)**2
-    return 2*R*np.arcsin(np.sqrt(a))
-
-def _finite_mask(arr):
-    import numpy as np
-    if isinstance(arr, np.ma.MaskedArray):
-        data = arr.filled(np.nan)
-        mask = ~arr.mask
-        return data, mask
-    else:
-        return arr, np.isfinite(arr)
-
-def nearest_ocean_value(da, ts, lat, lon, max_deg=0.75, expand_deg=5.0):
-    import numpy as np
-    t, y, x = guess_axes(da)
-    lon_vec = da.coords[x].values
-    lon_req = lon
-    if np.min(lon_vec) >= 0 and lon < 0:
-        lon_req = lon + 360
-    if np.max(lon_vec) > 180 and lon_req < 0:
-        lon_req = lon_req + 360
-
-    try:
-        sel = da.sel({t: ts, y: lat, x: lon_req}, method="nearest")
-        val = sel.values
-        data, _ = _finite_mask(val)
-        valf = float(np.array(data).squeeze()) if np.size(data) == 1 else np.nan
-        if np.isfinite(valf):
-            return valf, float(sel.coords[y]), float(sel.coords[x])
-    except Exception:
-        pass
-
-    def search_box(rad):
-        box = da.sel({t: ts, y: slice(lat-rad, lat+rad), x: slice(lon_req-rad, lon_req+rad)})
-        if box.size == 0:
-            return np.nan, lat, lon_req
-        yy = box.coords[y].values
-        xx = box.coords[x].values
-        Y, X = np.meshgrid(yy, xx, indexing="ij")
-        dist = haversine_km(lat, lon_req, Y, X)
-        arr = np.array(box.values)
-        data, mask = _finite_mask(arr)
-        if data.ndim >= 2:
-            d2 = dist.copy()
-            d2[~mask] = np.inf
-            if not np.isfinite(d2).any():
-                return np.nan, lat, lon_req
-            iy, ix = np.unravel_index(np.argmin(d2), d2.shape)
-            val = float(data[iy, ix])
-            return val, float(yy[iy]), float(xx[ix])
-        return np.nan, lat, lon_req
-
-    val, y_used, x_used = search_box(max_deg)
-    if not np.isfinite(val):
-        val, y_used, x_used = search_box(expand_deg)
-    return val, y_used, x_used
-
-def find_var(ds, *cands):
-    cands = [c.lower() for c in cands]
-    for k in ds.data_vars:
-        kl = k.lower()
-        if any(c in kl for c in cands):
-            return k
-    raise KeyError("No variable matched: " + ",".join(cands))
-
-def get_wind(ts: datetime, lat: float, lon: float):
-    tsn = to_naive_utc(ts)
-    today = datetime.now(timezone.utc).date()
-    recent_cut = today - timedelta(days=6)
-    lon0360 = to_0_360(lon)
-    if ts.date() >= recent_cut:
-        try:
-            url = gfswave_url_for(ts)
-            ds = open_thredds(url)
-            wspd_ms, y_used, x_used = nearest_ocean_value(ds["windsfc"], tsn, lat, lon0360)
-            wdir, _, _ = nearest_ocean_value(ds["wdirsfc"], tsn, y_used, x_used)
-            return {"source_wind": url, "wind_speed_kts": float(wspd_ms) * KTS_PER_MS, "wind_dir_from_degT": float(wdir)}
-        except Exception:
-            pass
-    try:
-        u = open_thredds(psl_u10_url(ts.year))
-        v = open_thredds(psl_v10_url(ts.year))
-        uval, y_used, x_used = nearest_ocean_value(u["uwnd"], tsn, lat, lon0360)
-        vval, _, _ = nearest_ocean_value(v["vwnd"], tsn, y_used, x_used)
-        spd_ms, dir_from = wind_from_uv(float(uval), float(vval))
-        return {"source_wind": psl_u10_url(ts.year), "wind_speed_kts": spd_ms * KTS_PER_MS, "wind_dir_from_degT": dir_from}
-    except Exception as e2:
-        return {"error_wind": f"{e2}"}
-
-def get_waves(ts: datetime, lat: float, lon: float):
-    tsn = to_naive_utc(ts)
-    today = datetime.now(timezone.utc).date()
-    recent_cut = today - timedelta(days=6)
-    try:
-        if ts.date() >= recent_cut:
-            url = gfswave_url_for(ts)
-            ds = open_thredds(url)
-            lon0360 = to_0_360(lon)
-            hs_val, y_used, x_used = nearest_ocean_value(ds["htsgwsfc"], tsn, lat, lon0360)
-            dir_sig_val, _, _      = nearest_ocean_value(ds["dirpwsfc"], tsn, y_used, x_used)
-            wvh_val, _, _          = nearest_ocean_value(ds["wvhgtsfc"], tsn, y_used, x_used)
-            wvdir_val, _, _        = nearest_ocean_value(ds["wvdirsfc"], tsn, y_used, x_used)
-            swh_val, _, _          = nearest_ocean_value(ds["swell_1"], tsn, y_used, x_used)
-            swdir_val, _, _        = nearest_ocean_value(ds["swdir_1"], tsn, y_used, x_used)
-        else:
-            url = pacioos_ww3_url()
-            ds = open_thredds(url)
-            var_hsig  = find_var(ds, "thgt", "hs", "significant wave height")
-            var_dirsg = find_var(ds, "tdir", "primary wave dir", "dirpw")
-            var_wvh   = find_var(ds, "whgt", "wind wave height", "sea height", "wind_sea")
-            var_wvdir = find_var(ds, "wdir", "wind wave direction", "sea direction")
-            var_swh   = find_var(ds, "shgt", "swell height")
-            var_swdir = find_var(ds, "sdir", "swell direction")
-            hs_val, y_used, x_used = nearest_ocean_value(ds[var_hsig],  tsn, lat, lon)
-            dir_sig_val, _, _      = nearest_ocean_value(ds[var_dirsg], tsn, y_used, x_used)
-            wvh_val, _, _          = nearest_ocean_value(ds[var_wvh],   tsn, y_used, x_used)
-            wvdir_val, _, _        = nearest_ocean_value(ds[var_wvdir], tsn, y_used, x_used)
-            swh_val, _, _          = nearest_ocean_value(ds[var_swh],   tsn, y_used, x_used)
-            swdir_val, _, _        = nearest_ocean_value(ds[var_swdir], tsn, y_used, x_used)
-            if not np.isfinite(wvh_val) and np.isfinite(hs_val) and np.isfinite(swh_val):
-                wvh_val = max(0.0, (hs_val**2 - swh_val**2))**0.5
-        return {
-            "source_wave": url,
-            "sampled_lat": y_used, "sampled_lon": x_used,
-            "wave_hgt_m": wvh_val, "wave_dir_degT": wvdir_val,
-            "swell_hgt_m": swh_val, "swell_dir_degT": swdir_val,
-            "sig_wave_hs_m": hs_val, "sig_wave_dir_degT": dir_sig_val,
-        }
-    except Exception as e:
-        return {"error_wave": f"{e}"}
-
-def _erddap_json_point(base, dataset, time_iso, lat, lon, var_u, var_v):
-    url = (
-        f"{base}/griddap/{dataset}.json?"
-        f"{var_u}[({time_iso})][({lat})][({lon})],"
-        f"{var_v}[({time_iso})][({lat})][({lon})]"
-    )
-    s = _requests_session()
-    r = s.get(url, timeout=20)
+def erddap_point_json(base, dataset, var_exprs):
+    url = f"{base}/griddap/{dataset}.json?{','.join(var_exprs)}"
+    r = S.get(url, timeout=30)
     r.raise_for_status()
     js = r.json()
     rows = js.get("table", {}).get("rows", [])
     if not rows:
-        return None
-    u, v = rows[0]
-    if u is None or v is None:
-        return None
-    return float(u), float(v), url
+        return None, url
+    vals = rows[0]
+    if not isinstance(vals, list):
+        vals = [vals]
+    return vals, url
 
-def get_currents(ts: datetime, lat: float, lon: float):
-    tsn = to_naive_utc(ts)
-    time_iso = tsn.replace(hour=0, minute=0, second=0, microsecond=0).isoformat() + "Z"
-    lon_m = lon if -180 <= lon <= 180 else ((lon + 180) % 360) - 180
+def to_iso_utc(ts: datetime):
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = ts.astimezone(timezone.utc)
+    return ts.isoformat().replace("+00:00", "Z")
+
+def to_daily_iso(ts: datetime):
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    else:
+        ts = ts.astimezone(timezone.utc)
+    ts = ts.replace(hour=0, minute=0, second=0, microsecond=0)
+    return ts.isoformat().replace("+00:00", "Z")
+
+def lon_to_m180_180(lon):
+    if lon > 180:
+        return ((lon + 180) % 360) - 180
+    if lon < -180:
+        return ((lon + 180) % 360) - 180
+    return lon
+
+def fetch_waves(time_utc: datetime, lat: float, lon: float):
+    t_iso = to_iso_utc(time_utc)
+    base = "https://pae-paha.pacioos.hawaii.edu/erddap"
+    ds = "ww3_global"
+    q = [
+        f"Thgt[({t_iso})][(0.0)][({lat})][({lon})]",
+        f"Tdir[({t_iso})][(0.0)][({lat})][({lon})]",
+        f"whgt[({t_iso})][(0.0)][({lat})][({lon})]",
+        f"wdir[({t_iso})][(0.0)][({lat})][({lon})]",
+        f"shgt[({t_iso})][(0.0)][({lat})][({lon})]",
+        f"sdir[({t_iso})][(0.0)][({lat})][({lon})]",
+    ]
+    vals, url = erddap_point_json(base, ds, q)
+    if vals is None:
+        return {"error_wave": "No WW3 value at/near time/point", "source_wave": url}
+    Thgt, Tdir, whgt, wdir, shgt, sdir = [None if v is None else float(v) for v in vals[-6:]]
+    return {
+        "source_wave": url,
+        "sig_wave_hs_m": Thgt, "sig_wave_dir_degT": Tdir,
+        "wave_hgt_m": whgt,     "wave_dir_degT": wdir,
+        "swell_hgt_m": shgt,    "swell_dir_degT": sdir,
+    }
+
+def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
+    t_iso = to_daily_iso(time_utc)
+    lon_m = lon_to_m180_180(lon)
+    base = "https://coastwatch.noaa.gov/erddap"
+    ds = "noaacwBlendedWindsDaily"
+    q = [
+        f"windspeed[({t_iso})][(10.0)][({lat})][({lon_m})]",
+        f"u_wind[({t_iso})][(10.0)][({lat})][({lon_m})]",
+        f"v_wind[({t_iso})][(10.0)][({lat})][({lon_m})]",
+    ]
+    vals, url = erddap_point_json(base, ds, q)
+    if vals is None:
+        return {"error_wind": "No wind daily value at/near time/point", "source_wind": url}
+    ws_ms, uw, vw = [None if v is None else float(v) for v in vals[-3:]]
+    if ws_ms is None or uw is None or vw is None:
+        return {"error_wind": "Wind value missing", "source_wind": url}
+    ws_kts = ws_ms * KTS_PER_MS
+    wdir_from = (270.0 - math.degrees(math.atan2(vw, uw))) % 360.0
+    return {
+        "source_wind": url,
+        "wind_speed_kts": ws_kts,
+        "wind_dir_from_degT": wdir_from,
+        "u_wind_ms": uw, "v_wind_ms": vw,
+    }
+
+def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
+    t_iso = to_daily_iso(time_utc)
+    lon_m = lon_to_m180_180(lon)
+    base = "https://coastwatch.noaa.gov/erddap"
+    ds = "noaacwBLENDEDNRTcurrentsDaily"
+    q = [
+        f"u_current[({t_iso})][({lat})][({lon_m})]",
+        f"v_current[({t_iso})][({lat})][({lon_m})]",
+    ]
     try:
-        out = _erddap_json_point(
-            "https://coastwatch.noaa.gov/erddap",
-            "noaacwBLENDEDNRTcurrentsDaily",
-            time_iso, lat, lon_m,
-            "u_current", "v_current"
-        )
-        if out:
-            u, v, url = out
-            spd_ms = float(np.hypot(u, v))
-            return {
-                "source_current": url,
-                "sampled_lat": lat, "sampled_lon": lon_m,
-                "current_speed_kts": spd_ms * KTS_PER_MS,
-                "current_dir_to_degT": current_dir_to(u, v),
-            }
+        vals, url = erddap_point_json(base, ds, q)
+        if vals is not None:
+            u, v = [None if v is None else float(v) for v in vals[-2:]]
+            if u is not None and v is not None:
+                spd_ms = float(math.hypot(u, v))
+                dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
+                return {
+                    "source_current": url,
+                    "current_speed_kts": spd_ms * KTS_PER_MS,
+                    "current_dir_to_degT": dir_to,
+                    "u_current_ms": u, "v_current_ms": v,
+                }
     except Exception:
         pass
+    base = "https://coastwatch.pfeg.noaa.gov/erddap"
+    ds = "oscar_vel"
+    q = [
+        f"u[({t_iso})][({lat})][({lon_m})]",
+        f"v[({t_iso})][({lat})][({lon_m})]",
+    ]
     try:
-        out = _erddap_json_point(
-            "https://coastwatch.pfeg.noaa.gov/erddap",
-            "oscar_vel",
-            time_iso, lat, lon_m,
-            "u", "v"
-        )
-        if out:
-            u, v, url = out
-            spd_ms = float(np.hypot(u, v))
-            return {
-                "source_current": url,
-                "sampled_lat": lat, "sampled_lon": lon_m,
-                "current_speed_kts": spd_ms * KTS_PER_MS,
-                "current_dir_to_degT": current_dir_to(u, v),
-            }
+        vals, url = erddap_point_json(base, ds, q)
+        if vals is not None:
+            u, v = [None if v is None else float(v) for v in vals[-2:]]
+            if u is not None and v is not None:
+                spd_ms = float(math.hypot(u, v))
+                dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
+                return {
+                    "source_current": url,
+                    "current_speed_kts": spd_ms * KTS_PER_MS,
+                    "current_dir_to_degT": dir_to,
+                    "u_current_ms": u, "v_current_ms": v,
+                }
     except Exception:
         pass
-    return {"error_current": "No current from ERDDAP JSON (both sources). Try a different day or offshore point."}
+    return {"error_current": "No surface current found (both datasets)"}
 
-mode = st.radio("Choose input mode", ["Single point", "Upload file"], horizontal=True)
-
-def color_for_wind(ws):
+def wind_color(ws_kts):
     try:
-        if ws < 16.0:
-            return "#1ea21e"
-        elif ws > 25.0:
-            return "#cc1f1f"
-        else:
-            return "#f0a202"
+        if ws_kts < 16:  return "#16a34a"
+        if ws_kts <= 25: return "#f59e0b"
+        return "#dc2626"
     except Exception:
-        return "#666666"
+        return "#6b7280"
 
-def render_map(df_points, ts_col_name="timestamp"):
-    if df_points.empty:
-        st.info("No points to map yet.")
-        return
-    clat = float(df_points["lat"].mean())
-    clon = float(df_points["lon"].mean())
+def render_map(df):
+    import folium
+    from streamlit_folium import st_folium
+    if df.empty:
+        st.info("No points to display"); return
+    clat = float(df["lat"].mean()); clon = float(df["lon"].mean())
     m = folium.Map(location=[clat, clon], zoom_start=3, tiles="OpenStreetMap")
     folium.TileLayer(
         tiles="https://tiles.openseamap.org/seamark/{z}/{x}/{y}.png",
         attr="Map data: © OpenSeaMap contributors",
         name="OpenSeaMap (Seamarks)",
-        overlay=True,
-        control=True,
+        overlay=True, control=True,
     ).add_to(m)
-    for _, r in df_points.iterrows():
-        ws = r.get("wind_speed_kts", np.nan)
-        wd = r.get("wind_dir_from_degT", np.nan)
-        hs = r.get("sig_wave_hs_m", np.nan)
-        hdir = r.get("sig_wave_dir_degT", np.nan)
-        wvh = r.get("wave_hgt_m", np.nan)
-        wvdir = r.get("wave_dir_degT", np.nan)
-        swh = r.get("swell_hgt_m", np.nan)
-        swdir = r.get("swell_dir_degT", np.nan)
-        curk = r.get("current_speed_kts", np.nan)
-        curdir = r.get("current_dir_to_degT", np.nan)
-        sampled_lat = r.get("sampled_lat", r["lat"])
-        sampled_lon = r.get("sampled_lon", r["lon"])
+    for _, r in df.iterrows():
+        ws = r.get("wind_speed_kts", np.nan); wd = r.get("wind_dir_from_degT", np.nan)
+        sig = r.get("sig_wave_hs_m", np.nan); sigd = r.get("sig_wave_dir_degT", np.nan)
+        wvh = r.get("wave_hgt_m", np.nan); wvd = r.get("wave_dir_degT", np.nan)
+        swh = r.get("swell_hgt_m", np.nan); swd = r.get("swell_dir_degT", np.nan)
+        curk = r.get("current_speed_kts", np.nan); curd = r.get("current_dir_to_degT", np.nan)
         tooltip = (
-            f"<b>{r[ts_col_name]}</b><br>"
+            f"<b>{r['timestamp']}</b><br>"
             f"Wind: {ws:.1f} kt from {wd:.0f}°T<br>"
-            f"SigWave: {hs:.1f} m from {hdir:.0f}°T<br>"
-            f"Wind-wave: {wvh:.1f} m from {wvdir:.0f}°T<br>"
-            f"Swell: {swh:.1f} m from {swdir:.0f}°T<br>"
-            f"Current: {curk:.2f} kt to {curdir:.0f}°T<br>"
-            f"<i>Sampled @ {sampled_lat:.3f}, {sampled_lon:.3f}</i>"
+            f"SigWave: {sig:.1f} m from {sigd:.0f}°T<br>"
+            f"Wind-sea: {wvh:.1f} m from {wvd:.0f}°T<br>"
+            f"Swell: {swh:.1f} m from {swd:.0f}°T<br>"
+            f"Current: {curk:.2f} kt to {curd:.0f}°T"
         )
         folium.CircleMarker(
             location=[float(r["lat"]), float(r["lon"])],
-            radius=6, color=color_for_wind(ws), fill=True, fill_opacity=0.9, weight=1,
+            radius=6, color=wind_color(ws), fill=True, fill_opacity=0.9, weight=1,
             tooltip=folium.Tooltip(tooltip, sticky=True),
         ).add_to(m)
     folium.LayerControl().add_to(m)
     st_folium(m, use_container_width=True, returned_objects=[])
 
+mode = st.radio("Choose input", ["Single point", "Upload file"], horizontal=True)
+
+def compute_row(ts_str, lat, lon):
+    try:
+        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+    except Exception:
+        return {"timestamp": ts_str, "lat": lat, "lon": lon, "error": "Invalid timestamp (use YYYY-MM-DD HH:MM UTC)"}
+    waves = fetch_waves(ts, lat, lon)
+    wind  = fetch_wind_daily(ts, lat, lon)
+    curr  = fetch_currents_daily(ts, lat, lon)
+    out = {"timestamp": ts_str, "lat": float(lat), "lon": float(lon)}
+    out.update(waves); out.update(wind); out.update(curr)
+    return out
+
 if mode == "Single point":
     with st.form("single"):
         c1, c2, c3 = st.columns([2,1,1])
         ts_str = c1.text_input("Timestamp (UTC, YYYY-MM-DD HH:MM)", "2025-07-10 06:00")
-        lat = c2.number_input("Latitude (°)", value=24.5, format="%.6f")
-        lon = c3.number_input("Longitude (°; −180..180 or 0..360)", value=54.4, format="%.6f")
-        submitted = st.form_submit_button("Get met-ocean")
-    if submitted:
-        try:
-            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
-        except ValueError:
-            st.error("Use format YYYY-MM-DD HH:MM (UTC).")
-            st.stop()
-        with st.spinner("Fetching…"):
-            wind = get_wind(ts, lat, lon)
-            wave = get_waves(ts, lat, lon)
-            cur = get_currents(ts, lat, lon)
-        rec = {"timestamp": ts_str, "lat": lat, "lon": lon}
-        rec.update(wind); rec.update(wave); rec.update(cur)
-        df_single = pd.DataFrame([rec])
+        lat = c2.number_input("Latitude (°)", value=-6.0, format="%.6f")
+        lon = c3.number_input("Longitude (° East positive; −180..180)", value=55.0, format="%.6f")
+        sub = st.form_submit_button("Get data")
+    if sub:
+        with st.spinner("Fetching from ERDDAP…"):
+            rec = compute_row(ts_str, lat, lon)
+        df = pd.DataFrame([rec])
         st.subheader("Result")
-        st.dataframe(df_single, use_container_width=True)
-        render_map(df_single)
+        st.dataframe(df, use_container_width=True)
+        render_map(df)
 else:
-    st.markdown("**Upload CSV or Excel** with columns: `timestamp`, `lat`, `lon` (case-insensitive). Time must be UTC.")
-    example = pd.DataFrame({
-        "timestamp": ["2025-07-10 06:00", "2024-11-03 12:00"],
-        "lat": [24.5, 12.0],
-        "lon": [54.4, 130.0],
-    })
-    with st.expander("Template / preview", expanded=False):
-        st.dataframe(example)
-
-    up = st.file_uploader("Choose CSV/XLSX", type=["csv", "xlsx"])
+    st.markdown("Upload **CSV/XLSX** with columns: `timestamp` (UTC `YYYY-MM-DD HH:MM`), `lat`, `lon`.")
+    up = st.file_uploader("Choose file", type=["csv", "xlsx"])
     if up is not None:
         if up.name.lower().endswith(".csv"):
             df_in = pd.read_csv(up)
         else:
             df_in = pd.read_excel(up)
-
-        df = df_in.copy()
-        cols = {c.lower(): c for c in df.columns}
-        ts_col = next((cols[k] for k in cols if k in ["timestamp","time","datetime"]), None)
-        lat_col = next((cols[k] for k in cols if k in ["lat","latitude"]), None)
-        lon_col = next((cols[k] for k in cols if k in ["lon","lng","longitude"]), None)
-
+        cols = {c.lower().strip(): c for c in df_in.columns}
+        ts_col = cols.get("timestamp") or cols.get("time") or cols.get("datetime")
+        lat_col = cols.get("lat") or cols.get("latitude")
+        lon_col = cols.get("lon") or cols.get("longitude") or cols.get("lng")
         if not (ts_col and lat_col and lon_col):
-            st.error("Could not find timestamp/lat/lon columns. Use headers: timestamp, lat, lon.")
-            st.stop()
-
-        df["_ts"] = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
-        for c in [lat_col, lon_col]:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-        if df["_ts"].isna().any() or df[[lat_col, lon_col]].isna().any().any():
-            st.error("Some timestamps or coordinates are invalid.")
-            st.stop()
-
-        records = []
-        prog = st.progress(0)
-        total = len(df)
-        for i, (_, row) in enumerate(df.iterrows(), start=1):
-            ts = row["_ts"].to_pydatetime()
-            lat = float(row[lat_col]); lon = float(row[lon_col])
-            wind = get_wind(ts, lat, lon)
-            wave = get_waves(ts, lat, lon)
-            cur = get_currents(ts, lat, lon)
-            rec = {"timestamp": row[ts_col], "lat": lat, "lon": lon}
-            rec.update(wind); rec.update(wave); rec.update(cur)
-            if "wind_speed_kts" in rec: rec["wind_speed_kts"] = float(rec["wind_speed_kts"])
-            if "current_speed_kts" in rec: rec["current_speed_kts"] = float(rec["current_speed_kts"])
-            records.append(rec)
+            st.error("Need headers: timestamp, lat, lon"); st.stop()
+        rows = []
+        prog = st.progress(0); total = len(df_in)
+        for i, (_, r) in enumerate(df_in.iterrows(), start=1):
+            ts_str = str(r[ts_col])
+            try:
+                lat = float(r[lat_col]); lon = float(r[lon_col])
+            except Exception:
+                rows.append({"timestamp": ts_str, "lat": r[lat_col], "lon": r[lon_col], "error": "Invalid lat/lon"})
+                prog.progress(i/total); continue
+            rows.append(compute_row(ts_str, lat, lon))
             prog.progress(i/total)
-
-        out = pd.DataFrame.from_records(records)
+        out = pd.DataFrame(rows)
         st.subheader("Results")
         st.dataframe(out, use_container_width=True)
-        csv = out.to_csv(index=False).encode("utf-8")
-        st.download_button("Download results (CSV)", csv, file_name="metocean_results.csv", mime="text/csv")
+        st.download_button("Download results (CSV)", out.to_csv(index=False).encode("utf-8"),
+                           file_name="metocean_results.csv", mime="text/csv")
         render_map(out)
