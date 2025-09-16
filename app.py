@@ -167,38 +167,59 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         "u_wind_ms": uw, "v_wind_ms": vw,
     }
 
+
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     t_iso = to_daily_iso(time_utc)
-    # CoastWatch winds use 0..360 longitudes
-    lon_m = lon_to_0_360(lon)
-    base = "https://coastwatch.noaa.gov/erddap"
-    ds = "noaacwBLENDEDNRTcurrentsDaily"
-    q = [
-        f"u_current[({t_iso})][({lat})][({lon_m})]",
-        f"v_current[({t_iso})][({lat})][({lon_m})]",
-    ]
-    vals, url, status = erddap_point_json(base, ds, q)
-    if vals is not None:
-        u, v = [None if v is None else float(v) for v in vals[-2:]]
-        if u is not None and v is not None:
-            spd_ms = float(math.hypot(u, v))
-            dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
-            return {
-                "source_current": url,
-                "current_speed_kts": spd_ms * KTS_PER_MS,
-                "current_dir_to_degT": dir_to,
-                "u_current_ms": u, "v_current_ms": v,
-            }
-    # Fallback: OSCAR
+
+    def try_coastwatch(lon_val):
+        base = "https://coastwatch.noaa.gov/erddap"
+        ds = "noaacwBLENDEDNRTcurrentsDaily"
+        q = [
+            f"u_current[({t_iso})][({lat})][({lon_val})]",
+            f"v_current[({t_iso})][({lat})][({lon_val})]",
+        ]
+        vals, url, status = erddap_point_json(base, ds, q)
+        if vals is not None:
+            try:
+                u, v = [None if v is None else float(v) for v in vals[-2:]]
+            except Exception:
+                u, v = None, None
+            if u is not None and v is not None:
+                spd_ms = float(math.hypot(u, v))
+                dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
+                return {
+                    "source_current": url,
+                    "current_speed_kts": spd_ms * KTS_PER_MS,
+                    "current_dir_to_degT": dir_to,
+                    "u_current_ms": u, "v_current_ms": v,
+                }
+        return None, f"{base}/griddap/{ds}.json?"+",".join(q), status
+
+    # Try CoastWatch with -180..180 first
+    out = try_coastwatch(lon_to_m180_180(lon))
+    if isinstance(out, tuple):
+        _, url_try1, status1 = out
+    else:
+        return out
+    # Try CoastWatch with 0..360 as a fallback
+    out2 = try_coastwatch(lon_to_0_360(lon))
+    if not isinstance(out2, tuple):
+        return out2
+    _, url_try2, status2 = out2
+
+    # Fallback: OSCAR on pfeg (uses -180..180)
     base2 = "https://coastwatch.pfeg.noaa.gov/erddap"
     ds2 = "oscar_vel"
     q2 = [
-        f"u[({t_iso})][({lat})][({lon_m})]",
-        f"v[({t_iso})][({lat})][({lon_m})]",
+        f"u[({t_iso})][({lat})][({lon_to_m180_180(lon)})]",
+        f"v[({t_iso})][({lat})][({lon_to_m180_180(lon)})]",
     ]
-    vals2, url2, status2 = erddap_point_json(base2, ds2, q2)
+    vals2, url2, status_oscar = erddap_point_json(base2, ds2, q2)
     if vals2 is not None:
-        u, v = [None if v is None else float(v) for v in vals2[-2:]]
+        try:
+            u, v = [None if v is None else float(v) for v in vals2[-2:]]
+        except Exception:
+            u, v = None, None
         if u is not None and v is not None:
             spd_ms = float(math.hypot(u, v))
             dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
@@ -209,8 +230,13 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
                 "u_current_ms": u, "v_current_ms": v,
                 "note_current": "OSCAR fallback",
             }
-    return {"error_current": f"Currents not available (HTTP {status}/{status2})"}
 
+    return {
+        "error_current": f"Currents not available (CW -180..180 HTTP {status1}; CW 0..360 HTTP {status2}; OSCAR HTTP {status_oscar})",
+        "source_current_try1": url_try1,
+        "source_current_try2": url_try2,
+        "source_current_oscar": f"{base2}/griddap/{ds2}.json?"+",".join(q2),
+    }
 def wind_color(ws_kts):
     try:
         if ws_kts < 16:  return "#16a34a"
