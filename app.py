@@ -137,7 +137,8 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
 
 def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     t_iso = to_daily_iso(time_utc)
-    lon_m = lon_to_m180_180(lon)
+    # CoastWatch winds use 0..360 longitudes
+    lon_m = lon_to_0_360(lon)
     base = "https://coastwatch.noaa.gov/erddap"
     ds = "noaacwBlendedWindsDaily"
     q = [
@@ -147,10 +148,16 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     ]
     vals, url, status = erddap_point_json(base, ds, q)
     if vals is None:
-        return {"error_wind": f"HTTP {status} or no rows", "source_wind": f"{base}/griddap/{ds}.html"}
+        # include the exact query for debug
+        qurl = f"{base}/griddap/{ds}.json?" + ','.join(q)
+        return {"error_wind": f"HTTP {status} or no rows", "source_wind": qurl}
     ws_ms, uw, vw = [None if v is None else float(v) for v in vals[-3:]]
+    # if windspeed is missing, compute from u/v
+    if (ws_ms is None) and (uw is not None) and (vw is not None):
+        ws_ms = float((uw**2 + vw**2) ** 0.5)
     if ws_ms is None or uw is None or vw is None:
-        return {"error_wind": "Missing field(s)", "source_wind": url}
+        qurl = f"{base}/griddap/{ds}.json?" + ','.join(q)
+        return {"error_wind": "Missing field(s)", "source_wind": qurl}
     ws_kts = ws_ms * KTS_PER_MS
     wdir_from = (270.0 - math.degrees(math.atan2(vw, uw))) % 360.0
     return {
@@ -162,7 +169,8 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
 
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     t_iso = to_daily_iso(time_utc)
-    lon_m = lon_to_m180_180(lon)
+    # CoastWatch winds use 0..360 longitudes
+    lon_m = lon_to_0_360(lon)
     base = "https://coastwatch.noaa.gov/erddap"
     ds = "noaacwBLENDEDNRTcurrentsDaily"
     q = [
