@@ -71,6 +71,20 @@ def lon_to_m180_180(lon):
         return ((lon + 180) % 360) - 180
     return lon
 
+
+def erddap_nearest_time(base, dataset, t_iso_want):
+    """Return (t_iso_actual, url). Queries the dataset's time axis to get the nearest available timestamp."""
+    q = [f"time[({t_iso_want})]"]
+    vals, url, status = erddap_point_json(base, dataset, q)
+    if vals is None or not vals:
+        return None, f"{base}/griddap/{dataset}.json?"+",".join(q)
+    # ERDDAP returns epoch seconds or ISO? For griddap .json table, it's ISO string in column 0 or last; capture last
+    v = vals[-1]
+    try:
+        # If numeric epoch seconds, we can't convert without timezone libs; but CoastWatch returns ISO string.
+        return str(v), url
+    except Exception:
+        return None, url
 def lon_to_0_360(lon):
     if lon < 0:
         return lon + 360.0
@@ -135,48 +149,54 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
         return out
     return {"error_wave": f"{pacioos_error}; NWW3 fallback also failed"}
 
+
 def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
-    t_iso = to_daily_iso(time_utc)
     # CoastWatch winds use 0..360 longitudes
-    lon_m = lon_to_0_360(lon)
     base = "https://coastwatch.noaa.gov/erddap"
     ds = "noaacwBlendedWindsDaily"
+    # Get nearest available daily timestamp
+    t_iso_want = to_daily_iso(time_utc)
+    t_iso_actual, t_url = erddap_nearest_time(base, ds, t_iso_want)
+    if not t_iso_actual:
+        t_iso_actual = t_iso_want  # fallback
+    lon_m = lon_to_0_360(lon)
     q = [
-        f"windspeed[({t_iso})][(10.0)][({lat})][({lon_m})]",
-        f"u_wind[({t_iso})][(10.0)][({lat})][({lon_m})]",
-        f"v_wind[({t_iso})][(10.0)][({lat})][({lon_m})]",
+        f"windspeed[({t_iso_actual})][(10.0)][({lat})][({lon_m})]",
+        f"u_wind[({t_iso_actual})][(10.0)][({lat})][({lon_m})]",
+        f"v_wind[({t_iso_actual})][(10.0)][({lat})][({lon_m})]",
     ]
     vals, url, status = erddap_point_json(base, ds, q)
     if vals is None:
-        # include the exact query for debug
-        qurl = f"{base}/griddap/{ds}.json?" + ','.join(q)
-        return {"error_wind": f"HTTP {status} or no rows", "source_wind": qurl}
+        qurl = f"{base}/griddap/{ds}.json?" + ",".join(q)
+        return {"error_wind": f"HTTP {status} or no rows", "source_wind": qurl, "wind_time_used": t_iso_actual, "wind_time_query": t_url}
     ws_ms, uw, vw = [None if v is None else float(v) for v in vals[-3:]]
-    # if windspeed is missing, compute from u/v
     if (ws_ms is None) and (uw is not None) and (vw is not None):
         ws_ms = float((uw**2 + vw**2) ** 0.5)
     if ws_ms is None or uw is None or vw is None:
-        qurl = f"{base}/griddap/{ds}.json?" + ','.join(q)
-        return {"error_wind": "Missing field(s)", "source_wind": qurl}
+        qurl = f"{base}/griddap/{ds}.json?" + ",".join(q)
+        return {"error_wind": "Missing field(s)", "source_wind": qurl, "wind_time_used": t_iso_actual, "wind_time_query": t_url}
     ws_kts = ws_ms * KTS_PER_MS
     wdir_from = (270.0 - math.degrees(math.atan2(vw, uw))) % 360.0
     return {
         "source_wind": url,
+        "wind_time_used": t_iso_actual,
         "wind_speed_kts": ws_kts,
         "wind_dir_from_degT": wdir_from,
         "u_wind_ms": uw, "v_wind_ms": vw,
     }
 
-
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
-    t_iso = to_daily_iso(time_utc)
+    base = "https://coastwatch.noaa.gov/erddap"
+    ds = "noaacwBLENDEDNRTcurrentsDaily"
+    t_iso_want = to_daily_iso(time_utc)
+    t_iso_actual, t_url = erddap_nearest_time(base, ds, t_iso_want)
+    if not t_iso_actual:
+        t_iso_actual = t_iso_want
 
     def try_coastwatch(lon_val):
-        base = "https://coastwatch.noaa.gov/erddap"
-        ds = "noaacwBLENDEDNRTcurrentsDaily"
         q = [
-            f"u_current[({t_iso})][({lat})][({lon_val})]",
-            f"v_current[({t_iso})][({lat})][({lon_val})]",
+            f"u_current[({t_iso_actual})][({lat})][({lon_val})]",
+            f"v_current[({t_iso_actual})][({lat})][({lon_val})]",
         ]
         vals, url, status = erddap_point_json(base, ds, q)
         if vals is not None:
@@ -189,30 +209,29 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
                 dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
                 return {
                     "source_current": url,
+                    "current_time_used": t_iso_actual,
                     "current_speed_kts": spd_ms * KTS_PER_MS,
                     "current_dir_to_degT": dir_to,
                     "u_current_ms": u, "v_current_ms": v,
                 }
         return None, f"{base}/griddap/{ds}.json?"+",".join(q), status
 
-    # Try CoastWatch with -180..180 first
     out = try_coastwatch(lon_to_m180_180(lon))
-    if isinstance(out, tuple):
-        _, url_try1, status1 = out
-    else:
+    if not isinstance(out, tuple):
         return out
-    # Try CoastWatch with 0..360 as a fallback
+    _, url_try1, status1 = out
+
     out2 = try_coastwatch(lon_to_0_360(lon))
     if not isinstance(out2, tuple):
         return out2
     _, url_try2, status2 = out2
 
-    # Fallback: OSCAR on pfeg (uses -180..180)
+    # Fallback: OSCAR
     base2 = "https://coastwatch.pfeg.noaa.gov/erddap"
     ds2 = "oscar_vel"
     q2 = [
-        f"u[({t_iso})][({lat})][({lon_to_m180_180(lon)})]",
-        f"v[({t_iso})][({lat})][({lon_to_m180_180(lon)})]",
+        f"u[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]",
+        f"v[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]",
     ]
     vals2, url2, status_oscar = erddap_point_json(base2, ds2, q2)
     if vals2 is not None:
@@ -225,6 +244,7 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
             dir_to = ( math.degrees(math.atan2(v, u)) ) % 360.0
             return {
                 "source_current": url2,
+                "current_time_used": t_iso_actual,
                 "current_speed_kts": spd_ms * KTS_PER_MS,
                 "current_dir_to_degT": dir_to,
                 "u_current_ms": u, "v_current_ms": v,
@@ -233,6 +253,8 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
 
     return {
         "error_current": f"Currents not available (CW -180..180 HTTP {status1}; CW 0..360 HTTP {status2}; OSCAR HTTP {status_oscar})",
+        "current_time_used": t_iso_actual,
+        "current_time_query": t_url,
         "source_current_try1": url_try1,
         "source_current_try2": url_try2,
         "source_current_oscar": f"{base2}/griddap/{ds2}.json?"+",".join(q2),
