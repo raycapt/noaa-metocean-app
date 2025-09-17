@@ -1,3 +1,3 @@
-# v10: fresh wind approach
-- Keep NOAA CoastWatch Blended Winds Daily first.
-- If unavailable/filled, fall back to **Open‑Meteo ERA5 hourly** (no API key).
+# v10b: fix SyntaxError, clean wind fallback
+- Fixed error return string.
+- CoastWatch first, Open‑Meteo ERA5 hourly fallback.

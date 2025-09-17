@@ -7,10 +7,10 @@ from urllib3.util.retry import Retry
 from datetime import datetime, timezone
 
 st.set_page_config(page_title="Global Met-Ocean @ Points (2024→Now)", layout="wide")
-st.title("Global Wind · Waves · Swell · Currents @ Positions (NOAA/WW3 + ERA5 fallback)")
-st.caption("Waves: WW3 (PacIOOS → NOAA NWW3 fallback). Currents: CoastWatch → OSCAR fallback. "
-           "Winds: CoastWatch blended daily → **Open‑Meteo ERA5 hourly fallback** (no API key). "
-           "Wave/swell/wind directions are FROM (°T). Currents are TO (°T). Wind shown in knots.")
+st.title("Global Wind · Waves · Swell · Currents @ Positions")
+st.caption("v10b — Waves: WW3 (PacIOOS → NOAA NWW3 fallback). Currents: CoastWatch → OSCAR. "
+           "Winds: CoastWatch blended daily → Open‑Meteo ERA5 hourly fallback. "
+           "Wave/swell/wind dirs are FROM (°T). Currents are TO (°T). Wind speeds shown in knots.")
 
 KTS_PER_MS = 1.9438444924574
 
@@ -122,7 +122,7 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     vals,url,status=erddap_point_json(base, ds, q)
     if vals is not None:
         ws_ms,uw,vw=[None if v is None else float(v) for v in vals[-3:]]
-        # Treat fill
+        # Treat fill values
         if ws_ms is not None and ws_ms<=-9000: ws_ms=None
         if uw is not None and uw<=-9000: uw=None
         if vw is not None and vw<=-9000: vw=None
@@ -134,8 +134,7 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
             return {"source_wind": url, "wind_time_used": t_iso_actual,
                     "wind_speed_kts": ws_kts, "wind_dir_from_degT": wdir_from,
                     "u_wind_ms": uw, "v_wind_ms": vw}
-    # ---- Fresh approach: Open‑Meteo ERA5 hourly fallback ----
-    # We get the exact hour of the user's timestamp (UTC) and fetch that hour.
+    # ---- Open‑Meteo ERA5 hourly fallback ----
     ts = time_utc.astimezone(timezone.utc) if time_utc.tzinfo else time_utc.replace(tzinfo=timezone.utc)
     date_str = ts.strftime("%Y-%m-%d")
     hour_str = ts.strftime("%Y-%m-%dT%H:00")
@@ -148,15 +147,13 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         if hour_str in times:
             idx = times.index(hour_str)
         else:
-            # if exact hour missing, pick nearest index
             idx = min(range(len(times)), key=lambda i: abs(datetime.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
         if idx is not None:
             uw = js["hourly"].get("wind_u_component_10m",[None])[idx]
             vw = js["hourly"].get("wind_v_component_10m",[None])[idx]
             ws = js["hourly"].get("wind_speed_10m",[None])[idx]
             wd = js["hourly"].get("wind_direction_10m",[None])[idx]
-            # prefer vector if available
-            if uw is not None and vw is not None:
+            if (uw is not None) and (vw is not None):
                 ws = float((uw**2+vw**2)**0.5)
                 wd = (270.0 - math.degrees(math.atan2(float(vw), float(uw))))%360.0
             if ws is not None and wd is not None:
@@ -167,8 +164,12 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
                         "v_wind_ms": float(vw) if vw is not None else None}
     except Exception:
         pass
-    return {"error_wind": f"Winds not available (CoastWatch HTTP {status}); ERA5 fallback also failed",
-            "source_wind_science": f\"{base}/griddap/{ds}.json?\" + \",\".join(q), "source_wind_era5": om_url}
+    # Final error payload (clean strings, no escapes)
+    return {
+        "error_wind": f"Winds not available (CoastWatch HTTP {status}); ERA5 fallback also failed",
+        "source_wind_science": f"{base}/griddap/{ds}.json?" + ",".join(q),
+        "source_wind_era5": om_url
+    }
 
 # -------- Currents (CoastWatch both lon domains -> OSCAR) --------
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
