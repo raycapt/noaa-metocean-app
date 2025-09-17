@@ -1,3 +1,4 @@
-# v10b: fix SyntaxError, clean wind fallback
-- Fixed error return string.
-- CoastWatch first, Open‑Meteo ERA5 hourly fallback.
+# v11: Stormglass integration
+- Add Stormglass point API for wind, wave, swell, currents when API key present (sidebar shows status).
+- Keep NOAA/WW3/ERA5 fallbacks for robustness.
+- Set secret in Streamlit Cloud as `STORMGLASS_API_KEY`.

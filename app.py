@@ -1,22 +1,33 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import requests, math
+import requests, math, os
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
 
 st.set_page_config(page_title="Global Met-Ocean @ Points (2024→Now)", layout="wide")
 st.title("Global Wind · Waves · Swell · Currents @ Positions")
-st.caption("v10b — Waves: WW3 (PacIOOS → NOAA NWW3 fallback). Currents: CoastWatch → OSCAR. "
-           "Winds: CoastWatch blended daily → Open‑Meteo ERA5 hourly fallback. "
-           "Wave/swell/wind dirs are FROM (°T). Currents are TO (°T). Wind speeds shown in knots.")
+st.caption("v11 — Stormglass + NOAA/WW3/ERA5 fallbacks. "
+           "Wave/swell/wind dirs are FROM (°T). Currents are TO (°T). Wind/current speeds in knots.")
 
 KTS_PER_MS = 1.9438444924574
 
+# ---------- Config / Secrets ----------
+def get_sg_api_key():
+    # Prefer Streamlit secrets
+    try:
+        k = st.secrets.get("STORMGLASS_API_KEY", None)
+        if k: return k
+    except Exception:
+        pass
+    # Fallback to environment variable
+    k = os.environ.get("STORMGLASS_API_KEY")
+    return k
+
 def _session():
     s = requests.Session()
-    s.headers.update({"User-Agent": "metocean-streamlit-json/1.0 (+https://github.com/)", "Accept": "application/json,text/*,*/*"})
+    s.headers.update({"User-Agent": "metocean-streamlit/1.0 (+github)"})
     retry = Retry(total=4, connect=4, read=4, backoff_factor=0.6, status_forcelist=[429,500,502,503,504], allowed_methods=["GET"])
     s.mount("http://", HTTPAdapter(max_retries=retry))
     s.mount("https://", HTTPAdapter(max_retries=retry))
@@ -77,6 +88,142 @@ def erddap_nearest_time(base, dataset, t_iso_want):
     except Exception:
         return None, url
 
+# ---------- Stormglass integration ----------
+SG_DEFAULT_SOURCES = ["noaa","meto","icon","gfs","dwd","fmi","mf","smhi","yr","bom","sg"]
+
+def sg_pick(value_obj, sources=SG_DEFAULT_SOURCES):
+    """value_obj is like {'noaa': 1.2, 'sg': 1.3}. Pick first available by source priority."""
+    if value_obj is None: return None, None
+    if isinstance(value_obj, (int,float)):  # already scalar
+        return float(value_obj), "sg"
+    if isinstance(value_obj, dict):
+        for s in sources:
+            if s in value_obj and value_obj[s] is not None:
+                try:
+                    return float(value_obj[s]), s
+                except Exception:
+                    continue
+    return None, None
+
+def fetch_stormglass(time_utc: datetime, lat: float, lon: float, sources=SG_DEFAULT_SOURCES):
+    """Fetch wind, waves, swell, currents for the hour (Stormglass point API)."""
+    api_key = get_sg_api_key()
+    if not api_key:
+        return {"sg_used": False, "sg_note": "No API key configured"}
+
+    ts = time_utc.astimezone(timezone.utc) if time_utc.tzinfo else time_utc.replace(tzinfo=timezone.utc)
+    date_str = ts.strftime("%Y-%m-%d")
+    start = f"{date_str}T00:00:00Z"
+    end   = f"{date_str}T23:59:59Z"
+
+    params = ",".join([
+        "windSpeed","windDirection",
+        "waveHeight","waveDirection",
+        "swellHeight","swellDirection",
+        "currentSpeed","currentDirection"
+    ])
+
+    headers = {"Authorization": api_key}
+
+    url1 = f"https://api.stormglass.io/v2/weather/point?lat={lat}&lng={lon}&params={params}&start={start}&end={end}"
+    try:
+        r = S.get(url1, headers=headers, timeout=30)
+        ok1 = r.ok
+        js1 = r.json() if ok1 else {}
+    except Exception:
+        ok1 = False; js1 = {}
+
+    need_marine = False
+    for k in ("waveHeight","swellHeight","currentSpeed"):
+        if ok1 and js1.get("hours"):
+            if all(k not in h for h in js1["hours"]):
+                need_marine = True
+        else:
+            need_marine = True
+    js2 = {}; url2 = None
+    if need_marine:
+        url2 = f"https://api.stormglass.io/v2/marine/point?lat={lat}&lng={lon}&params={params}&start={start}&end={end}"
+        try:
+            r2 = S.get(url2, headers=headers, timeout=30)
+            if r2.ok: js2 = r2.json()
+        except Exception:
+            js2 = {}
+
+    def hours_by_time(obj):
+        m = {}
+        for h in obj.get("hours", []) if isinstance(obj, dict) else []:
+            t = h.get("time"); 
+            if t: m[t] = h
+        return m
+
+    h1 = hours_by_time(js1); h2 = hours_by_time(js2)
+
+    def pick_closest_hour():
+        want = ts.replace(minute=0, second=0, microsecond=0)
+        candidates = set(list(h1.keys()) + list(h2.keys()))
+        if not candidates: return None, None
+        def tparse(s):
+            try:
+                return datetime.fromisoformat(s.replace("Z","+00:00"))
+            except Exception:
+                return None
+        best = None; best_dt = None
+        for s in candidates:
+            dt = tparse(s); 
+            if dt is None: continue
+            if best_dt is None or abs((dt - want).total_seconds()) < abs((best_dt - want).total_seconds()):
+                best_dt = dt; best = s
+        return best, best_dt
+
+    best_key, best_dt = pick_closest_hour()
+    if not best_key:
+        return {"sg_used": False, "sg_note": "Stormglass returned no hours for this day",
+                "source_sg_weather": url1, "source_sg_marine": url2}
+
+    def getp(name):
+        val_obj = None
+        if best_key in h1 and name in h1[best_key]: val_obj = h1[best_key][name]
+        if (val_obj is None or (isinstance(val_obj, dict) and not val_obj)) and best_key in h2 and name in h2[best_key]:
+            val_obj = h2[best_key][name]
+        val, src = sg_pick(val_obj, sources)
+        return val, src
+
+    ws, src_ws = getp("windSpeed")
+    wd, src_wd = getp("windDirection")
+    wh, src_wh = getp("waveHeight")
+    wd_wv, src_wd_wv = getp("waveDirection")
+    sh, src_sh = getp("swellHeight")
+    sd, src_sd = getp("swellDirection")
+    cs, src_cs = getp("currentSpeed")
+    cd, src_cd = getp("currentDirection")
+
+    out = {"sg_used": True, "wind_time_used": best_key}
+    if ws is not None:
+        out["wind_speed_kts"] = float(ws) * KTS_PER_MS
+        out["wind_dir_from_degT"] = float(wd) if wd is not None else None
+        out["u_wind_ms"] = None; out["v_wind_ms"] = None
+        out["source_wind"] = (url1 if ws is not None else url2)
+        out["note_wind"] = f"Stormglass ({src_ws or 'sg'})"
+    if wh is not None:
+        out["wave_hgt_m"] = float(wh)
+        out["wave_dir_degT"] = float(wd_wv) if wd_wv is not None else None
+        out["source_wave"] = (url1 if wh is not None else url2)
+        out["note_wave"] = f"Stormglass ({src_wh or 'sg'})"
+    if sh is not None:
+        out["swell_hgt_m"] = float(sh)
+        out["swell_dir_degT"] = float(sd) if sd is not None else None
+    if cs is not None:
+        out["current_speed_kts"] = float(cs) * KTS_PER_MS
+        out["current_dir_to_degT"] = float(cd) if cd is not None else None
+        out["source_current"] = (url1 if cs is not None else url2)
+        out["note_current"] = f"Stormglass ({src_cs or 'sg'})"
+    if "sig_wave_hs_m" not in out and ("wave_hgt_m" in out):
+        out["sig_wave_hs_m"] = out["wave_hgt_m"]
+        out["sig_wave_dir_degT"] = out.get("wave_dir_degT")
+    out["source_sg_weather"] = url1
+    if url2: out["source_sg_marine"] = url2
+    return out
+
 # -------- Waves (PacIOOS -> NOAA NWW3 fallback) --------
 def fetch_waves(time_utc: datetime, lat: float, lon: float):
     t_iso = to_iso_utc(time_utc)
@@ -92,7 +239,6 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
         Thgt, Tdir, whgt, wdir, shgt, sdir = [None if v is None else float(v) for v in vals[-6:]]
         return {"source_wave": url, "sig_wave_hs_m": Thgt, "sig_wave_dir_degT": Tdir,
                 "wave_hgt_m": whgt, "wave_dir_degT": wdir, "swell_hgt_m": shgt, "swell_dir_degT": sdir}
-    # Fallback: NOAA NWW3
     base2="https://coastwatch.pfeg.noaa.gov/erddap"; ds2="NWW3_Global_Best"; lon_cw=lon_to_m180_180(lon)
     got={}; url2=None
     for grp in [["htsgwsfc","dirpwsfc"],["wvhgtsfc","wvdirsfc"],["swell_1","swdir_1"]]:
@@ -109,8 +255,7 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
                 "note_wave": "PacIOOS WW3 failed; using NOAA NWW3 fallback"}
     return {"error_wave": "No WW3/NWW3 value at/near time/point"}
 
-# -------- Wind (NOAA CoastWatch -> NOAA NRT -> Open‑Meteo ERA5 fallback) --------
-
+# -------- Wind (NOAA Science -> NOAA NRT -> ERA5) --------
 def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBlendedWindsDaily"
     t_iso_want=to_daily_iso(time_utc)
@@ -134,8 +279,6 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
             return {"source_wind": url, "wind_time_used": t_iso_actual,
                     "wind_speed_kts": ws_kts, "wind_dir_from_degT": wdir_from,
                     "u_wind_ms": uw, "v_wind_ms": vw}
-
-    # ---- NOAA NRT fallback (shorter latency window) ----
     ds_nrt="noaacwBlendednrtWindsDaily"
     t_iso_actual2,t_url2=erddap_nearest_time(base, ds_nrt, t_iso_want)
     if not t_iso_actual2: t_iso_actual2=t_iso_want
@@ -156,10 +299,7 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
             return {"source_wind": url2, "note_wind": "NOAA NRT winds fallback",
                     "wind_time_used": t_iso_actual2, "wind_speed_kts": ws_kts,
                     "wind_dir_from_degT": wdir_from, "u_wind_ms": uw, "v_wind_ms": vw}
-
-    # ---- Open‑Meteo ERA5 hourly fallback (clamp to yesterday UTC) ----
     ts = time_utc.astimezone(timezone.utc) if time_utc.tzinfo else time_utc.replace(tzinfo=timezone.utc)
-    # Clamp request date to <= yesterday UTC
     yesterday_utc = (datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=1)).date()
     req_date = min(ts.date(), yesterday_utc)
     date_str = req_date.strftime("%Y-%m-%d")
@@ -173,7 +313,6 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         if hour_str in times:
             idx = times.index(hour_str)
         else:
-            # choose nearest hour on that day
             from datetime import datetime as _dt
             idx = min(range(len(times)), key=lambda i: abs(_dt.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
         if idx is not None:
@@ -192,13 +331,11 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
                         "v_wind_ms": float(vw) if vw is not None else None}
     except Exception:
         pass
+    return {"error_wind": f"Winds not available (science HTTP {status}; NRT HTTP {status2}); ERA5 fallback also failed",
+            "source_wind_science": f"{base}/griddap/{ds}.json?" + ",".join(q),
+            "source_wind_nrt": f"{base}/griddap/{ds_nrt}.json?" + ",".join(q2),
+            "source_wind_era5": om_url}
 
-    return {
-        "error_wind": f"Winds not available (science HTTP {status}; NRT HTTP {status2}); ERA5 fallback also failed",
-        "source_wind_science": f"{base}/griddap/{ds}.json?" + ",".join(q),
-        "source_wind_nrt": f"{base}/griddap/{ds_nrt}.json?" + ",".join(q2),
-        "source_wind_era5": om_url
-    }
 # -------- Currents (CoastWatch both lon domains -> OSCAR) --------
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBLENDEDNRTcurrentsDaily"
@@ -227,7 +364,6 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     if not isinstance(out2, tuple): return out2
     _,url2,st2=out2
 
-    # Fallback: OSCAR
     base2="https://coastwatch.pfeg.noaa.gov/erddap"; ds2="oscar_vel"
     q2=[f"u[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]",
         f"v[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]"]
@@ -279,6 +415,20 @@ def render_map(df):
     folium.LayerControl().add_to(m)
     st_folium(m, use_container_width=True, returned_objects=[])
 
+# Sidebar: Stormglass toggle & source priority
+with st.sidebar:
+    st.markdown("### Stormglass")
+    sg_key_present = bool(get_sg_api_key())
+    if sg_key_present:
+        st.success("API key found in secrets/env. Stormglass will be used first.")
+    else:
+        st.info("No API key found. Add **STORMGLASS_API_KEY** in Streamlit **Secrets** or ENV to enable Stormglass.")
+    src_order = st.text_input("Source priority (comma-separated)", ",".join(SG_DEFAULT_SOURCES))
+    try:
+        SG_SOURCES = [s.strip() for s in src_order.split(",") if s.strip()]
+    except Exception:
+        SG_SOURCES = SG_DEFAULT_SOURCES
+
 mode = st.radio("Choose input", ["Single point", "Upload file"], horizontal=True)
 
 def compute_row(ts_str, lat, lon):
@@ -286,11 +436,18 @@ def compute_row(ts_str, lat, lon):
         ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
     except Exception:
         return {"timestamp": ts_str, "lat": lat, "lon": lon, "error": "Invalid timestamp (use YYYY-MM-DD HH:MM UTC)"}
-    waves = fetch_waves(ts, lat, lon)
-    wind  = fetch_wind_daily(ts, lat, lon)
-    curr  = fetch_currents_daily(ts, lat, lon)
+
+    # 1) Stormglass first (if key available)
+    sg = fetch_stormglass(ts, lat, lon, sources=SG_SOURCES) if get_sg_api_key() else {"sg_used": False}
+
+    # 2) For anything missing, fall back to the original providers
+    waves = {} if sg.get("sig_wave_hs_m") or sg.get("wave_hgt_m") else fetch_waves(ts, lat, lon)
+    wind  = {} if sg.get("wind_speed_kts") else fetch_wind_daily(ts, lat, lon)
+    curr  = {} if sg.get("current_speed_kts") else fetch_currents_daily(ts, lat, lon)
+
     out = {"timestamp": ts_str, "lat": float(lat), "lon": float(lon)}
-    out.update(waves); out.update(wind); out.update(curr)
+    for d in (sg, waves, wind, curr):
+        if d: out.update(d)
     return out
 
 if mode == "Single point":
