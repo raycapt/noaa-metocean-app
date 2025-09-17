@@ -109,7 +109,8 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
                 "note_wave": "PacIOOS WW3 failed; using NOAA NWW3 fallback"}
     return {"error_wave": "No WW3/NWW3 value at/near time/point"}
 
-# -------- Wind (NOAA CoastWatch -> Open‑Meteo ERA5 fallback) --------
+# -------- Wind (NOAA CoastWatch -> NOAA NRT -> Open‑Meteo ERA5 fallback) --------
+
 def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBlendedWindsDaily"
     t_iso_want=to_daily_iso(time_utc)
@@ -122,7 +123,6 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     vals,url,status=erddap_point_json(base, ds, q)
     if vals is not None:
         ws_ms,uw,vw=[None if v is None else float(v) for v in vals[-3:]]
-        # Treat fill values
         if ws_ms is not None and ws_ms<=-9000: ws_ms=None
         if uw is not None and uw<=-9000: uw=None
         if vw is not None and vw<=-9000: vw=None
@@ -134,9 +134,35 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
             return {"source_wind": url, "wind_time_used": t_iso_actual,
                     "wind_speed_kts": ws_kts, "wind_dir_from_degT": wdir_from,
                     "u_wind_ms": uw, "v_wind_ms": vw}
-    # ---- Open‑Meteo ERA5 hourly fallback ----
+
+    # ---- NOAA NRT fallback (shorter latency window) ----
+    ds_nrt="noaacwBlendednrtWindsDaily"
+    t_iso_actual2,t_url2=erddap_nearest_time(base, ds_nrt, t_iso_want)
+    if not t_iso_actual2: t_iso_actual2=t_iso_want
+    q2=[f"windspeed[({t_iso_actual2})][(10.0)][({lat})][({lon_m})]",
+        f"u_wind[({t_iso_actual2})][(10.0)][({lat})][({lon_m})]",
+        f"v_wind[({t_iso_actual2})][(10.0)][({lat})][({lon_m})]"]
+    vals2,url2,status2=erddap_point_json(base, ds_nrt, q2)
+    if vals2 is not None:
+        ws_ms,uw,vw=[None if v is None else float(v) for v in vals2[-3:]]
+        if ws_ms is not None and ws_ms<=-9000: ws_ms=None
+        if uw is not None and uw<=-9000: uw=None
+        if vw is not None and vw<=-9000: vw=None
+        if (ws_ms is None) and (uw is not None) and (vw is not None):
+            ws_ms=float((uw**2+vw**2)**0.5)
+        if ws_ms is not None and uw is not None and vw is not None:
+            ws_kts=ws_ms*KTS_PER_MS
+            wdir_from=(270.0 - math.degrees(math.atan2(vw, uw)))%360.0
+            return {"source_wind": url2, "note_wind": "NOAA NRT winds fallback",
+                    "wind_time_used": t_iso_actual2, "wind_speed_kts": ws_kts,
+                    "wind_dir_from_degT": wdir_from, "u_wind_ms": uw, "v_wind_ms": vw}
+
+    # ---- Open‑Meteo ERA5 hourly fallback (clamp to yesterday UTC) ----
     ts = time_utc.astimezone(timezone.utc) if time_utc.tzinfo else time_utc.replace(tzinfo=timezone.utc)
-    date_str = ts.strftime("%Y-%m-%d")
+    # Clamp request date to <= yesterday UTC
+    yesterday_utc = (datetime.utcnow().replace(tzinfo=timezone.utc) - timedelta(days=1)).date()
+    req_date = min(ts.date(), yesterday_utc)
+    date_str = req_date.strftime("%Y-%m-%d")
     hour_str = ts.strftime("%Y-%m-%dT%H:00")
     om_url = ("https://archive-api.open-meteo.com/v1/era5"
               f"?latitude={lat}&longitude={lon}&hourly=wind_speed_10m,wind_direction_10m,wind_u_component_10m,wind_v_component_10m"
@@ -147,7 +173,9 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         if hour_str in times:
             idx = times.index(hour_str)
         else:
-            idx = min(range(len(times)), key=lambda i: abs(datetime.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
+            # choose nearest hour on that day
+            from datetime import datetime as _dt
+            idx = min(range(len(times)), key=lambda i: abs(_dt.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
         if idx is not None:
             uw = js["hourly"].get("wind_u_component_10m",[None])[idx]
             vw = js["hourly"].get("wind_v_component_10m",[None])[idx]
@@ -164,13 +192,13 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
                         "v_wind_ms": float(vw) if vw is not None else None}
     except Exception:
         pass
-    # Final error payload (clean strings, no escapes)
+
     return {
-        "error_wind": f"Winds not available (CoastWatch HTTP {status}); ERA5 fallback also failed",
+        "error_wind": f"Winds not available (science HTTP {status}; NRT HTTP {status2}); ERA5 fallback also failed",
         "source_wind_science": f"{base}/griddap/{ds}.json?" + ",".join(q),
+        "source_wind_nrt": f"{base}/griddap/{ds_nrt}.json?" + ",".join(q2),
         "source_wind_era5": om_url
     }
-
 # -------- Currents (CoastWatch both lon domains -> OSCAR) --------
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBLENDEDNRTcurrentsDaily"
