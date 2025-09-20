@@ -1,66 +1,104 @@
+
 import streamlit as st
 import pandas as pd
 import requests
-from datetime import datetime, timezone
+import datetime
+import folium
+from folium.plugins import MarkerCluster
+from streamlit_folium import st_folium
 
-st.set_page_config(page_title="NOAA Stormglass App", layout="wide")
-st.title("🌊 NOAA + Stormglass Metocean Extractor")
-st.caption("Upload a file with `timestamp`, `lat`, and `lon`. Format: `YYYY-MM-DD HH:MM UTC` (24H format)")
+# -- SETTINGS --
+st.set_page_config(layout="wide")
+API_KEY = st.secrets.get("STORMGLASS_API", "YOUR_API_KEY_HERE")
+API_URL = "https://api.stormglass.io/v2/weather/point"
+PARAMS = ["windSpeed", "waveHeight", "swellHeight", "swellDirection", "swellPeriod", "currentSpeed"]
 
-stormglass_api_key = st.secrets["STORMGLASS_API_KEY"] if "STORMGLASS_API_KEY" in st.secrets else st.text_input("Enter Stormglass API Key", type="password")
+# -- HELPERS --
+def fetch_weather_data(lat, lon, time_utc):
+    iso_time = time_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
+    headers = {"Authorization": API_KEY}
+    params = {
+        "lat": lat,
+        "lng": lon,
+        "params": ",".join(PARAMS),
+        "start": iso_time,
+        "end": iso_time,
+        "source": "noaa"
+    }
+    r = requests.get(API_URL, headers=headers, params=params)
+    if r.status_code != 200:
+        return {"error": f"API Error {r.status_code}"}
+    data = r.json().get("hours", [{}])[0]
+    result = {p: data.get(p, {}).get("noaa", None) for p in PARAMS}
+    return result
 
-uploaded_file = st.file_uploader("Upload Excel (.xlsx) file", type="xlsx")
-sample_df = pd.DataFrame({
-    "timestamp": ["2025-09-01 10:00 UTC", "2025-09-03 12:00 UTC"],
-    "lat": [25.2, 26.5],
-    "lon": [55.3, 54.9]
-})
-
-with st.expander("📋 Sample Format"):
-    st.dataframe(sample_df, use_container_width=True)
-
-def fetch_stormglass_data(ts, lat, lon):
-    url = f"https://api.stormglass.io/v2/weather/point?lat={lat}&lng={lon}&params=windSpeed,waveHeight,currentSpeed&start={ts}&end={ts}"
-    headers = {"Authorization": stormglass_api_key}
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200:
-        return {"error": f"Stormglass API error: {response.status_code}"}
+def is_valid_row(row):
     try:
-        data = response.json()
-        hour_data = data.get("hours", [{}])[0]
-        return {
-            "windSpeed": hour_data.get("windSpeed", {}).get("sg", None),
-            "waveHeight": hour_data.get("waveHeight", {}).get("sg", None),
-            "currentSpeed": hour_data.get("currentSpeed", {}).get("sg", None),
-            "source": "Stormglass",
-        }
-    except Exception as e:
-        return {"error": str(e)}
+        datetime.datetime.strptime(str(row['timestamp']), "%Y-%m-%d %H:%M:%S")
+        return pd.notna(row['lat']) and pd.notna(row['lon'])
+    except:
+        return False
 
+# -- INTERFACE --
+st.title("🌊 Stormglass Weather Fetcher")
+st.markdown("Enter up to 5 manual positions and upload Excel for bulk fetch. Hover map to view data.")
+
+# Manual input
+st.subheader("Manual Data Entry")
+manual_data = []
+with st.form("manual_form"):
+    for i in range(5):
+        cols = st.columns(3)
+        ts = cols[0].text_input(f"Timestamp {i+1} (UTC, YYYY-MM-DD HH:MM:SS)", key=f"ts{i}")
+        lat = cols[1].text_input(f"Latitude {i+1}", key=f"lat{i}")
+        lon = cols[2].text_input(f"Longitude {i+1}", key=f"lon{i}")
+        if ts and lat and lon:
+            manual_data.append({"timestamp": ts, "lat": float(lat), "lon": float(lon)})
+    submitted = st.form_submit_button("Fetch Weather for Manual Entries")
+
+# Upload file
+st.subheader("Upload Excel File")
+uploaded_file = st.file_uploader("Upload Excel with headers: timestamp, lat, lon", type=["xlsx"])
+file_data = []
 if uploaded_file:
-    df_in = pd.read_excel(uploaded_file)
-    cols = {str(c).lower().strip(): c for c in df_in.columns}
+    df_file = pd.read_excel(uploaded_file)
+    df_file = df_file.dropna(subset=["timestamp", "lat", "lon"])
+    df_file["timestamp"] = pd.to_datetime(df_file["timestamp"], errors='coerce')
+    file_data = df_file.to_dict("records")
 
-    if not all(k in cols for k in ["timestamp", "lat", "lon"]):
-        st.error("Excel must contain columns: 'timestamp', 'lat', 'lon'")
-        st.stop()
+# Combine data
+all_data = []
+if submitted:
+    all_data.extend(manual_data)
+if file_data:
+    all_data.extend(file_data)
 
-    df_out = []
-    for _, row in df_in.iterrows():
+# Fetch & display
+if all_data:
+    st.success(f"Processing {len(all_data)} positions...")
+    results = []
+    m = folium.Map(location=[0, 0], zoom_start=2)
+    marker_cluster = MarkerCluster().add_to(m)
+
+    for row in all_data:
         try:
-            ts_str = str(row[cols["timestamp"]]).replace(" UTC", "").strip()
-            ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M")
-            ts_unix = int(ts.replace(tzinfo=timezone.utc).timestamp())
-            data = fetch_stormglass_data(ts_unix, row[cols["lat"]], row[cols["lon"]])
-            row_out = row.to_dict()
-            row_out.update(data)
-            df_out.append(row_out)
+            ts = pd.to_datetime(row["timestamp"])
+            lat = float(row["lat"])
+            lon = float(row["lon"])
+            weather = fetch_weather_data(lat, lon, ts)
+            row.update(weather)
+            popup = f"Lat: {lat}, Lon: {lon}<br>Time: {ts}<br>"
+            popup += "<br>".join([f"{k}: {v}" for k, v in weather.items()])
+            folium.Marker(location=[lat, lon], popup=popup).add_to(marker_cluster)
+            results.append(row)
         except Exception as e:
-            row_out = row.to_dict()
-            row_out["error"] = str(e)
-            df_out.append(row_out)
+            row["error"] = str(e)
+            results.append(row)
 
-    df_result = pd.DataFrame(df_out)
-    st.success("✅ Extraction complete")
-    st.dataframe(df_result, use_container_width=True)
-    st.download_button("⬇️ Download Results", data=df_result.to_csv(index=False), file_name="metocean_results.csv", mime="text/csv")
+    df_result = pd.DataFrame(results)
+    st.subheader("📌 Weather Data Table")
+    st.dataframe(df_result)
+    st.download_button("Download CSV", df_result.to_csv(index=False), "weather_results.csv")
+
+    st.subheader("🗺️ Map View")
+    st_folium(m, width=1000, height=600)
