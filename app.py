@@ -49,13 +49,15 @@ with tab_bulk:
     do_bulk = st.button("Fetch uploaded points")
 
 @st.cache_data(show_spinner=False)
-def _fetch_one(_lat, _lon, _ts_str, _client: StormglassClient):
-    parsed = pd.to_datetime(_ts_str, utc=True, errors="coerce")
+def _fetch_one(_lat, _lon, _ts_iso, _source, _api_key):
+    """Fetch a single point using primitives so cache keys are correct per row."""
+    client_local = StormglassClient(api_key=_api_key or "DUMMY", source=_source)
+    parsed = pd.to_datetime(_ts_iso, utc=True, errors="coerce")
     if pd.isna(parsed):
         return None
     try:
-        payload = _client.fetch_point(float(_lat), float(_lon), parsed.to_pydatetime())
-        values = _client.extract_values(payload)
+        payload = client_local.fetch_point(float(_lat), float(_lon), parsed.to_pydatetime())
+        values = client_local.extract_values(payload)
         return values
     except Exception as e:
         return {"error": str(e)}
@@ -63,7 +65,7 @@ def _fetch_one(_lat, _lon, _ts_str, _client: StormglassClient):
 def enrich_df(df_in: pd.DataFrame, client: StormglassClient):
     rows = []
     for _, r in df_in.iterrows():
-        res = _fetch_one(r["lat"], r["lon"], r["parsed_ts"].isoformat(), client)
+        res = _fetch_one(r["lat"], r["lon"], r["parsed_ts"].isoformat(), source, api_key)
         if res is None:
             rows.append({})
             continue
@@ -127,16 +129,27 @@ def make_map(df_points: pd.DataFrame):
     for _, r in df_points.iterrows():
         wind_kt = r.get("windSpeed_kt")
         color = wind_color(wind_kt if wind_kt is not None else float("nan"))
+        # Format speeds to 1 decimal place on hover
+        ws = r.get("windSpeed_kt")
+        cs = r.get("currentSpeed_kt")
+        try:
+            ws_txt = f"{float(ws):.1f}" if ws is not None and not pd.isna(ws) else ""
+        except Exception:
+            ws_txt = ""
+        try:
+            cs_txt = f"{float(cs):.1f}" if cs is not None and not pd.isna(cs) else ""
+        except Exception:
+            cs_txt = ""
 
         tt = folium.Tooltip(
             f"""
 <b>Time (UTC):</b> {r.get('timestamp_utc') or ''}<br>
 <b>Lat/Lon:</b> {r.get('lat'):.4f}, {r.get('lon'):.4f}<br>
-<b>Wind:</b> {r.get('windSpeed_kt','')} kt @ {r.get('windDir_deg_from','')}° (from)<br>
+<b>Wind:</b> {ws_txt} kt @ {r.get('windDir_deg_from','')}° (from)<br>
 <b>Significant wave (Hs):</b> {r.get('sigWaveHeight_m','')} m @ {r.get('sigWaveDir_deg_from','')}° (from)<br>
 <b>Wind wave:</b> {r.get('windWaveHeight_m','')} m @ {r.get('windWaveDir_deg_from','')}° (from)<br>
 <b>Swell:</b> {r.get('swellHeight_m','')} m @ {r.get('swellDir_deg_from','')}° (from)<br>
-<b>Current:</b> {r.get('currentSpeed_kt','')} kt @ {r.get('currentDir_deg_to','')}° (to)
+<b>Current:</b> {cs_txt} kt @ {r.get('currentDir_deg_to','')}° (to)
 """,
             sticky=True
         )
