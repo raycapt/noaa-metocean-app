@@ -1,4 +1,10 @@
-# v11: Stormglass integration
-- Add Stormglass point API for wind, wave, swell, currents when API key present (sidebar shows status).
-- Keep NOAA/WW3/ERA5 fallbacks for robustness.
-- Set secret in Streamlit Cloud as `STORMGLASS_API_KEY`.
+# NOAA Metocean App
+
+This app fetches Metocean data (wind, wave, swell, significant wave height, and ocean currents) for a given time and location using NOAA/Stormglass APIs.
+
+## Inputs:
+- Timestamp (UTC)
+- Latitude and Longitude
+
+## Outputs:
+- JSON object with weather and ocean data

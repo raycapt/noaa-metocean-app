@@ -1,7 +1,4 @@
 streamlit
-pandas
-numpy
 requests
+pandas
 openpyxl
-folium
-streamlit-folium
