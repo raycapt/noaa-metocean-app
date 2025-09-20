@@ -8,22 +8,19 @@ from datetime import datetime, timezone, timedelta
 
 st.set_page_config(page_title="Global Met-Ocean @ Points (2024→Now)", layout="wide")
 st.title("Global Wind · Waves · Swell · Currents @ Positions")
-st.caption("v11 — Stormglass + NOAA/WW3/ERA5 fallbacks. "
+st.caption("v11s — Stormglass + NOAA/WW3/ERA5 fallbacks. Accepts timestamps with **HH:MM** or **HH:MM:SS**. "
            "Wave/swell/wind dirs are FROM (°T). Currents are TO (°T). Wind/current speeds in knots.")
 
 KTS_PER_MS = 1.9438444924574
 
-# ---------- Config / Secrets ----------
 def get_sg_api_key():
-    # Prefer Streamlit secrets
     try:
         k = st.secrets.get("STORMGLASS_API_KEY", None)
-        if k: return k
+        if k:
+            return k
     except Exception:
         pass
-    # Fallback to environment variable
-    k = os.environ.get("STORMGLASS_API_KEY")
-    return k
+    return os.environ.get("STORMGLASS_API_KEY")
 
 def _session():
     s = requests.Session()
@@ -88,58 +85,42 @@ def erddap_nearest_time(base, dataset, t_iso_want):
     except Exception:
         return None, url
 
-# ---------- Stormglass integration ----------
+# -------- Stormglass --------
 SG_DEFAULT_SOURCES = ["noaa","meto","icon","gfs","dwd","fmi","mf","smhi","yr","bom","sg"]
 
 def sg_pick(value_obj, sources=SG_DEFAULT_SOURCES):
-    """value_obj is like {'noaa': 1.2, 'sg': 1.3}. Pick first available by source priority."""
     if value_obj is None: return None, None
-    if isinstance(value_obj, (int,float)):  # already scalar
-        return float(value_obj), "sg"
+    if isinstance(value_obj, (int,float)): return float(value_obj), "sg"
     if isinstance(value_obj, dict):
         for s in sources:
             if s in value_obj and value_obj[s] is not None:
-                try:
-                    return float(value_obj[s]), s
-                except Exception:
-                    continue
+                try: return float(value_obj[s]), s
+                except Exception: continue
     return None, None
 
 def fetch_stormglass(time_utc: datetime, lat: float, lon: float, sources=SG_DEFAULT_SOURCES):
-    """Fetch wind, waves, swell, currents for the hour (Stormglass point API)."""
     api_key = get_sg_api_key()
     if not api_key:
         return {"sg_used": False, "sg_note": "No API key configured"}
 
     ts = time_utc.astimezone(timezone.utc) if time_utc.tzinfo else time_utc.replace(tzinfo=timezone.utc)
     date_str = ts.strftime("%Y-%m-%d")
-    start = f"{date_str}T00:00:00Z"
-    end   = f"{date_str}T23:59:59Z"
-
-    params = ",".join([
-        "windSpeed","windDirection",
-        "waveHeight","waveDirection",
-        "swellHeight","swellDirection",
-        "currentSpeed","currentDirection"
-    ])
-
+    start = f"{date_str}T00:00:00Z"; end = f"{date_str}T23:59:59Z"
+    params = ",".join(["windSpeed","windDirection","waveHeight","waveDirection","swellHeight","swellDirection","currentSpeed","currentDirection"])
     headers = {"Authorization": api_key}
-
     url1 = f"https://api.stormglass.io/v2/weather/point?lat={lat}&lng={lon}&params={params}&start={start}&end={end}"
     try:
-        r = S.get(url1, headers=headers, timeout=30)
-        ok1 = r.ok
-        js1 = r.json() if ok1 else {}
+        r1 = S.get(url1, headers=headers, timeout=30); ok1 = r1.ok; js1 = r1.json() if ok1 else {}
     except Exception:
         ok1 = False; js1 = {}
 
     need_marine = False
     for k in ("waveHeight","swellHeight","currentSpeed"):
         if ok1 and js1.get("hours"):
-            if all(k not in h for h in js1["hours"]):
-                need_marine = True
+            if all(k not in h for h in js1["hours"]): need_marine = True
         else:
             need_marine = True
+
     js2 = {}; url2 = None
     if need_marine:
         url2 = f"https://api.stormglass.io/v2/marine/point?lat={lat}&lng={lon}&params={params}&start={start}&end={end}"
@@ -163,10 +144,8 @@ def fetch_stormglass(time_utc: datetime, lat: float, lon: float, sources=SG_DEFA
         candidates = set(list(h1.keys()) + list(h2.keys()))
         if not candidates: return None, None
         def tparse(s):
-            try:
-                return datetime.fromisoformat(s.replace("Z","+00:00"))
-            except Exception:
-                return None
+            try: return datetime.fromisoformat(s.replace("Z","+00:00"))
+            except Exception: return None
         best = None; best_dt = None
         for s in candidates:
             dt = tparse(s); 
@@ -183,19 +162,13 @@ def fetch_stormglass(time_utc: datetime, lat: float, lon: float, sources=SG_DEFA
     def getp(name):
         val_obj = None
         if best_key in h1 and name in h1[best_key]: val_obj = h1[best_key][name]
-        if (val_obj is None or (isinstance(val_obj, dict) and not val_obj)) and best_key in h2 and name in h2[best_key]:
-            val_obj = h2[best_key][name]
-        val, src = sg_pick(val_obj, sources)
-        return val, src
+        if (val_obj is None or (isinstance(val_obj, dict) and not val_obj)) and best_key in h2 and name in h2[best_key]: val_obj = h2[best_key][name]
+        val, src = sg_pick(val_obj, sources); return val, src
 
-    ws, src_ws = getp("windSpeed")
-    wd, src_wd = getp("windDirection")
-    wh, src_wh = getp("waveHeight")
-    wd_wv, src_wd_wv = getp("waveDirection")
-    sh, src_sh = getp("swellHeight")
-    sd, src_sd = getp("swellDirection")
-    cs, src_cs = getp("currentSpeed")
-    cd, src_cd = getp("currentDirection")
+    ws, src_ws = getp("windSpeed"); wd, src_wd = getp("windDirection")
+    wh, src_wh = getp("waveHeight"); wd_wv, src_wd_wv = getp("waveDirection")
+    sh, src_sh = getp("swellHeight"); sd, src_sd = getp("swellDirection")
+    cs, src_cs = getp("currentSpeed"); cd, src_cd = getp("currentDirection")
 
     out = {"sg_used": True, "wind_time_used": best_key}
     if ws is not None:
@@ -224,7 +197,7 @@ def fetch_stormglass(time_utc: datetime, lat: float, lon: float, sources=SG_DEFA
     if url2: out["source_sg_marine"] = url2
     return out
 
-# -------- Waves (PacIOOS -> NOAA NWW3 fallback) --------
+# -------- Waves (PacIOOS WW3 -> NOAA NWW3) --------
 def fetch_waves(time_utc: datetime, lat: float, lon: float):
     t_iso = to_iso_utc(time_utc)
     base = "https://pae-paha.pacioos.hawaii.edu/erddap"; ds = "ww3_global"; lon_p = lon_to_0_360(lon)
@@ -258,8 +231,7 @@ def fetch_waves(time_utc: datetime, lat: float, lon: float):
 # -------- Wind (NOAA Science -> NOAA NRT -> ERA5) --------
 def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBlendedWindsDaily"
-    t_iso_want=to_daily_iso(time_utc)
-    t_iso_actual,t_url=erddap_nearest_time(base, ds, t_iso_want)
+    t_iso_want=to_daily_iso(time_utc); t_iso_actual,_=erddap_nearest_time(base, ds, t_iso_want)
     if not t_iso_actual: t_iso_actual=t_iso_want
     lon_m=lon_to_0_360(lon)
     q=[f"windspeed[({t_iso_actual})][(10.0)][({lat})][({lon_m})]",
@@ -271,16 +243,14 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         if ws_ms is not None and ws_ms<=-9000: ws_ms=None
         if uw is not None and uw<=-9000: uw=None
         if vw is not None and vw<=-9000: vw=None
-        if (ws_ms is None) and (uw is not None) and (vw is not None):
-            ws_ms=float((uw**2+vw**2)**0.5)
+        if (ws_ms is None) and (uw is not None) and (vw is not None): ws_ms=float((uw**2+vw**2)**0.5)
         if ws_ms is not None and uw is not None and vw is not None:
-            ws_kts=ws_ms*KTS_PER_MS
-            wdir_from=(270.0 - math.degrees(math.atan2(vw, uw)))%360.0
+            ws_kts=ws_ms*KTS_PER_MS; wdir_from=(270.0 - math.degrees(math.atan2(vw, uw)))%360.0
             return {"source_wind": url, "wind_time_used": t_iso_actual,
                     "wind_speed_kts": ws_kts, "wind_dir_from_degT": wdir_from,
                     "u_wind_ms": uw, "v_wind_ms": vw}
     ds_nrt="noaacwBlendednrtWindsDaily"
-    t_iso_actual2,t_url2=erddap_nearest_time(base, ds_nrt, t_iso_want)
+    t_iso_actual2,_=erddap_nearest_time(base, ds_nrt, t_iso_want)
     if not t_iso_actual2: t_iso_actual2=t_iso_want
     q2=[f"windspeed[({t_iso_actual2})][(10.0)][({lat})][({lon_m})]",
         f"u_wind[({t_iso_actual2})][(10.0)][({lat})][({lon_m})]",
@@ -291,11 +261,9 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
         if ws_ms is not None and ws_ms<=-9000: ws_ms=None
         if uw is not None and uw<=-9000: uw=None
         if vw is not None and vw<=-9000: vw=None
-        if (ws_ms is None) and (uw is not None) and (vw is not None):
-            ws_ms=float((uw**2+vw**2)**0.5)
+        if (ws_ms is None) and (uw is not None) and (vw is not None): ws_ms=float((uw**2+vw**2)**0.5)
         if ws_ms is not None and uw is not None and vw is not None:
-            ws_kts=ws_ms*KTS_PER_MS
-            wdir_from=(270.0 - math.degrees(math.atan2(vw, uw)))%360.0
+            ws_kts=ws_ms*KTS_PER_MS; wdir_from=(270.0 - math.degrees(math.atan2(vw, uw)))%360.0
             return {"source_wind": url2, "note_wind": "NOAA NRT winds fallback",
                     "wind_time_used": t_iso_actual2, "wind_speed_kts": ws_kts,
                     "wind_dir_from_degT": wdir_from, "u_wind_ms": uw, "v_wind_ms": vw}
@@ -310,11 +278,9 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     try:
         r=S.get(om_url, timeout=30); r.raise_for_status(); js=r.json()
         times = js.get("hourly", {}).get("time", [])
-        if hour_str in times:
-            idx = times.index(hour_str)
+        if hour_str in times: idx = times.index(hour_str)
         else:
-            from datetime import datetime as _dt
-            idx = min(range(len(times)), key=lambda i: abs(_dt.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
+            idx = min(range(len(times)), key=lambda i: abs(datetime.fromisoformat(times[i]).timestamp() - ts.timestamp())) if times else None
         if idx is not None:
             uw = js["hourly"].get("wind_u_component_10m",[None])[idx]
             vw = js["hourly"].get("wind_v_component_10m",[None])[idx]
@@ -332,20 +298,17 @@ def fetch_wind_daily(time_utc: datetime, lat: float, lon: float):
     except Exception:
         pass
     return {"error_wind": f"Winds not available (science HTTP {status}; NRT HTTP {status2}); ERA5 fallback also failed",
-            "source_wind_science": f"{base}/griddap/{ds}.json?" + ",".join(q),
-            "source_wind_nrt": f"{base}/griddap/{ds_nrt}.json?" + ",".join(q2),
+            "source_wind_science": f"{base}/griddap/{ds}.json?"+",".join(q),
+            "source_wind_nrt": f"{base}/griddap/{ds_nrt}.json?"+",".join(q2),
             "source_wind_era5": om_url}
 
-# -------- Currents (CoastWatch both lon domains -> OSCAR) --------
+# -------- Currents (CoastWatch -> OSCAR) --------
 def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
     base="https://coastwatch.noaa.gov/erddap"; ds="noaacwBLENDEDNRTcurrentsDaily"
-    t_iso_want=to_daily_iso(time_utc)
-    t_iso_actual,t_url=erddap_nearest_time(base, ds, t_iso_want)
+    t_iso_want=to_daily_iso(time_utc); t_iso_actual,t_url=erddap_nearest_time(base, ds, t_iso_want)
     if not t_iso_actual: t_iso_actual=t_iso_want
-
     def try_cw(lon_val):
-        q=[f"u_current[({t_iso_actual})][({lat})][({lon_val})]",
-           f"v_current[({t_iso_actual})][({lat})][({lon_val})]"]
+        q=[f"u_current[({t_iso_actual})][({lat})][({lon_val})]", f"v_current[({t_iso_actual})][({lat})][({lon_val})]"]
         vals,url,status=erddap_point_json(base, ds, q)
         if vals is not None:
             try: u,v=[None if v is None else float(v) for v in vals[-2:]]
@@ -356,14 +319,12 @@ def fetch_currents_daily(time_utc: datetime, lat: float, lon: float):
                         "current_speed_kts": spd_ms*KTS_PER_MS, "current_dir_to_degT": dir_to,
                         "u_current_ms": u, "v_current_ms": v}
         return None, f"{base}/griddap/{ds}.json?"+",".join(q), status
-
     out=try_cw(lon_to_m180_180(lon))
     if not isinstance(out, tuple): return out
     _,url1,st1=out
     out2=try_cw(lon_to_0_360(lon))
     if not isinstance(out2, tuple): return out2
     _,url2,st2=out2
-
     base2="https://coastwatch.pfeg.noaa.gov/erddap"; ds2="oscar_vel"
     q2=[f"u[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]",
         f"v[({t_iso_actual})][({lat})][({lon_to_m180_180(lon)})]"]
@@ -409,42 +370,37 @@ def render_map(df):
                  f"Wind-sea: {wvh:.1f} m from {wvd:.0f}°T<br>"
                  f"Swell: {swh:.1f} m from {swd:.0f}°T<br>"
                  f"Current: {curk:.2f} kt to {curd:.0f}°T")
+        from folium import Tooltip
         folium.CircleMarker(location=[float(r["lat"]), float(r["lon"])],
                             radius=6, color=wind_color(ws), fill=True, fill_opacity=0.9, weight=1,
-                            tooltip=folium.Tooltip(tooltip, sticky=True)).add_to(m)
+                            tooltip=Tooltip(tooltip, sticky=True)).add_to(m)
     folium.LayerControl().add_to(m)
     st_folium(m, use_container_width=True, returned_objects=[])
 
-# Sidebar: Stormglass toggle & source priority
-with st.sidebar:
-    st.markdown("### Stormglass")
-    sg_key_present = bool(get_sg_api_key())
-    if sg_key_present:
-        st.success("API key found in secrets/env. Stormglass will be used first.")
-    else:
-        st.info("No API key found. Add **STORMGLASS_API_KEY** in Streamlit **Secrets** or ENV to enable Stormglass.")
-    src_order = st.text_input("Source priority (comma-separated)", ",".join(SG_DEFAULT_SOURCES))
+def _parse_ts_any(s):
+    s = str(s).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
     try:
-        SG_SOURCES = [s.strip() for s in src_order.split(",") if s.strip()]
+        return pd.to_datetime(s, utc=True, errors="raise").to_pydatetime()
     except Exception:
-        SG_SOURCES = SG_DEFAULT_SOURCES
+        raise
 
 mode = st.radio("Choose input", ["Single point", "Upload file"], horizontal=True)
 
 def compute_row(ts_str, lat, lon):
     try:
-        ts = datetime.strptime(ts_str, "%Y-%m-%d %H:%M").replace(tzinfo=timezone.utc)
+        ts = _parse_ts_any(ts_str)
     except Exception:
-        return {"timestamp": ts_str, "lat": lat, "lon": lon, "error": "Invalid timestamp (use YYYY-MM-DD HH:MM UTC)"}
-
-    # 1) Stormglass first (if key available)
-    sg = fetch_stormglass(ts, lat, lon, sources=SG_SOURCES) if get_sg_api_key() else {"sg_used": False}
-
-    # 2) For anything missing, fall back to the original providers
+        return {"timestamp": ts_str, "lat": lat, "lon": lon,
+                "error": "Invalid timestamp (need YYYY-MM-DD HH:MM or HH:MM:SS, UTC)"}
+    sg = fetch_stormglass(ts, lat, lon, sources=SG_DEFAULT_SOURCES) if get_sg_api_key() else {"sg_used": False}
     waves = {} if sg.get("sig_wave_hs_m") or sg.get("wave_hgt_m") else fetch_waves(ts, lat, lon)
     wind  = {} if sg.get("wind_speed_kts") else fetch_wind_daily(ts, lat, lon)
     curr  = {} if sg.get("current_speed_kts") else fetch_currents_daily(ts, lat, lon)
-
     out = {"timestamp": ts_str, "lat": float(lat), "lon": float(lon)}
     for d in (sg, waves, wind, curr):
         if d: out.update(d)
@@ -453,7 +409,7 @@ def compute_row(ts_str, lat, lon):
 if mode == "Single point":
     with st.form("single"):
         c1, c2, c3 = st.columns([2,1,1])
-        ts_str = c1.text_input("Timestamp (UTC, YYYY-MM-DD HH:MM)", "2025-07-10 06:00")
+        ts_str = c1.text_input("Timestamp (UTC, YYYY-MM-DD HH:MM or HH:MM:SS)", "2025-07-10 06:00")
         lat = c2.number_input("Latitude (°)", value=-6.0, format="%.6f")
         lon = c3.number_input("Longitude (° East positive; −180..180)", value=55.0, format="%.6f")
         sub = st.form_submit_button("Get data")
@@ -461,37 +417,28 @@ if mode == "Single point":
         with st.spinner("Fetching…"):
             rec = compute_row(ts_str, lat, lon)
         df = pd.DataFrame([rec])
-        st.subheader("Result")
-        st.dataframe(df, use_container_width=True)
-        render_map(df)
+        st.subheader("Result"); st.dataframe(df, use_container_width=True); render_map(df)
 else:
-    st.markdown("Upload **CSV/XLSX** with columns: `timestamp` (UTC `YYYY-MM-DD HH:MM`), `lat`, `lon`.")
-    up = st.file_uploader("Choose file", type=["csv", "xlsx"])
+    st.markdown("Upload **CSV/XLSX** with columns: `timestamp` (UTC `YYYY-MM-DD HH:MM` **or** `YYYY-MM-DD HH:MM:SS`), `lat`, `lon`.")
+    up = st.file_uploader("Choose file", type=["csv","xlsx"])
     if up is not None:
-        if up.name.lower().endswith(".csv"):
-            df_in = pd.read_csv(up)
-        else:
-            df_in = pd.read_excel(up)
+        df_in = pd.read_csv(up) if up.name.lower().endswith(".csv") else pd.read_excel(up)
         cols = {c.lower().strip(): c for c in df_in.columns}
         ts_col = cols.get("timestamp") or cols.get("time") or cols.get("datetime")
         lat_col = cols.get("lat") or cols.get("latitude")
         lon_col = cols.get("lon") or cols.get("longitude") or cols.get("lng")
-        if not (ts_col and lat_col and lon_col):
-            st.error("Need headers: timestamp, lat, lon"); st.stop()
-        rows = []
-        prog = st.progress(0); total = len(df_in)
+        if not (ts_col and lat_col and lon_col): st.error("Need headers: timestamp, lat, lon"); st.stop()
+        rows = []; prog = st.progress(0); total = len(df_in)
         for i, (_, r) in enumerate(df_in.iterrows(), start=1):
             ts_str = str(r[ts_col])
             try:
-                lat = float(r[lat_col]); lon = float(r[lon_col])
+                lat_v = float(r[lat_col]); lon_v = float(r[lon_col])
             except Exception:
                 rows.append({"timestamp": ts_str, "lat": r[lat_col], "lon": r[lon_col], "error": "Invalid lat/lon"})
                 prog.progress(i/total); continue
-            rows.append(compute_row(ts_str, lat, lon))
-            prog.progress(i/total)
+            rows.append(compute_row(ts_str, lat_v, lon_v)); prog.progress(i/total)
         out = pd.DataFrame(rows)
-        st.subheader("Results")
-        st.dataframe(out, use_container_width=True)
+        st.subheader("Results"); st.dataframe(out, use_container_width=True)
         st.download_button("Download results (CSV)", out.to_csv(index=False).encode("utf-8"),
                            file_name="metocean_results.csv", mime="text/csv")
         render_map(out)
