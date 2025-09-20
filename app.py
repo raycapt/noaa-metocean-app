@@ -48,9 +48,8 @@ with tab_bulk:
     uploaded = st.file_uploader("Upload CSV/XLSX with columns: timestamp, lat, lon", type=["csv","xlsx"])
     do_bulk = st.button("Fetch uploaded points")
 
-@st.cache_data(show_spinner=False)
 def _fetch_one(_lat, _lon, _ts_iso, _source, _api_key):
-    """Fetch a single point using primitives so cache keys are correct per row."""
+    """Fetch a single point (no caching) to avoid accidental reuse across rows."""
     client_local = StormglassClient(api_key=_api_key or "DUMMY", source=_source)
     parsed = pd.to_datetime(_ts_iso, utc=True, errors="coerce")
     if pd.isna(parsed):
@@ -58,9 +57,14 @@ def _fetch_one(_lat, _lon, _ts_iso, _source, _api_key):
     try:
         payload = client_local.fetch_point(float(_lat), float(_lon), parsed.to_pydatetime())
         values = client_local.extract_values(payload)
+        # Attach back what we asked for
+        values = values or {}
+        values["requested_iso"] = parsed.isoformat()
+        values["req_lat"] = float(_lat)
+        values["req_lon"] = float(_lon)
         return values
     except Exception as e:
-        return {"error": str(e)}
+        return {"error": str(e), "requested_iso": str(_ts_iso), "req_lat": _lat, "req_lon": _lon}
 
 def enrich_df(df_in: pd.DataFrame, client: StormglassClient):
     rows = []
@@ -99,7 +103,7 @@ def enrich_df(df_in: pd.DataFrame, client: StormglassClient):
 
     # Order columns
     preferred_cols = [
-        "timestamp_utc","iso_time","lat","lon",
+        "timestamp_utc","requested_iso","iso_time","lat","lon",
         "windSpeed_kt","windDir_deg_from",
         "sigWaveHeight_m","sigWaveDir_deg_from",
         "windWaveHeight_m","windWaveDir_deg_from",
